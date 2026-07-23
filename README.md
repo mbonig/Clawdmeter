@@ -1,10 +1,21 @@
 # Clawdmeter
 
-A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
+> **This fork's scope:** this is a fork of
+> [HermannBjorgvin/Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter),
+> which supports several square/AMOLED Waveshare boards (see below). This fork
+> narrows that down to **one board only** — the round
+> [Waveshare ESP32-S3-Touch-LCD-1.85B](https://www.waveshare.com/esp32-s3-touch-lcd-1.85b.htm?&aff_id=149786).
+> The other boards' code is still present (shared HAL, same repo history) and
+> may well still build and run, but it isn't what's being actively developed,
+> tested, or supported here — round display, that's it. If you have one of
+> the AMOLED boards, the upstream project is the better fit. If you have the
+> round LCD-1.85B, jump to [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup)
+> for the exact steps.
 
-It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) as well as a few other alternative boards and pairs over Bluetooth, the splash screen plays pixel-art Clawd animations that get
-busier when your usage rate climbs. The two side buttons send Space and
-Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
+A small ESP32 dashboard to keep an eye on Claude Code usage.
+
+This fork runs on the round [Waveshare ESP32-S3-Touch-LCD-1.85B](https://www.waveshare.com/esp32-s3-touch-lcd-1.85b.htm?&aff_id=149786) and pairs over Bluetooth; the splash screen plays pixel-art Clawd animations that get
+busier when your usage rate climbs. The BOOT button sends Space over BLE HID for Claude Code's voice-mode shortcut. (The screenshots and side-button description below are inherited from the upstream project's square/AMOLED boards — see [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) for what's actually true on this board.)
 
 |              Usage meter              |              Clawd animation screen              |
 | :-----------------------------------: | :----------------------------------------------: |
@@ -23,20 +34,82 @@ The device boots into the splash. Tap the screen anywhere to switch to the Usage
 
 While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
+> The round LCD-1.85B board has no PWR button, so animation-cycling and the
+> hold-to-pair gesture above don't apply to it — touch-toggling between
+> splash and Usage still works fine. See
+> [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup).
+
+## Agent worktree manager
+
+Using this space to advertise another one of my projects. It's in the prototyping stages and is my take on an agent worktree manager similar to Claude Squad with integrations for GitHub and Azure DevOps. Written to meet my needs at work which is maintaining a monorepo and often having multiple worktrees open simultaneously as well as often needing to review code while I am working on other things.
+
+[Kirby - AI Agent worktree and pull request manager](https://github.com/hermannbjorgvin/kirby)
+
 ## Hardware
 
-Boards supported out of the box:
+**Supported by this fork:**
+
+- [Waveshare ESP32-S3-Touch-LCD-1.85B](https://www.waveshare.com/esp32-s3-touch-lcd-1.85b.htm?&aff_id=149786) — round 360×360 TFT, PlatformIO env `waveshare_lcd_185b`. This is the only board this fork is built and tested against; see [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) below.
+
+<details>
+<summary>Inherited from upstream — square/AMOLED boards (not maintained here)</summary>
+
+These board ports live in the same shared HAL and will likely still build, but they aren't what this fork tests or develops against. For active support, use [the upstream project](https://github.com/HermannBjorgvin/Clawdmeter) instead.
 
 - [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786)
-- [Waveshare ESP32-C6-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-c6-touch-amoled-2.16.htm?&aff_id=149786) 
+- [Waveshare ESP32-C6-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-c6-touch-amoled-2.16.htm?&aff_id=149786)
 - [Waveshare ESP32-S3-Touch-AMOLED-1.8](https://www.waveshare.com/esp32-s3-touch-amoled-1.8.htm?&aff_id=149786)
 - [Waveshare ESP32-C6-Touch-AMOLED-1.8](https://www.waveshare.com/esp32-c6-touch-amoled-1.8.htm?&aff_id=149786)
 - [Waveshare ESP32-S3-Touch-AMOLED-2.06](https://www.waveshare.com/esp32-s3-touch-amoled-2.06.htm?&aff_id=149786)
 - [Waveshare ESP32-S3-Touch-LCD-1.54](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869) (240x240 SPI TFT, not AMOLED)
 
+</details>
+
 > Please check if a pull request exists for your alternative hardware port before opening a new one, providing QA feedback and testing on the same hardware is more valuable than duplicate pull requests.
 
 **Porting to another board:** the firmware is a thin HAL with per-board folders under `firmware/src/boards/`. Drop in a new folder and a new PlatformIO env — `main.cpp`, `ui.cpp`, and `splash.cpp` never need to change. See [`docs/porting/adding-a-board.md`](docs/porting/adding-a-board.md) for the walk-through and [`docs/porting/hal-contract.md`](docs/porting/hal-contract.md) for the interfaces a port must implement.
+
+## Round board (LCD-1.85B) setup
+
+The steps below (Prerequisites, then your OS's installation section) work the
+same for this board as for any other — just use the PlatformIO env
+**`waveshare_lcd_185b`** wherever a board name is asked for, e.g.:
+
+```bash
+./flash-mac.sh waveshare_lcd_185b                       # macOS, auto-detects the port
+./flash.sh waveshare_lcd_185b                           # Linux, defaults to /dev/ttyACM0
+pio run -d firmware -e waveshare_lcd_185b -t upload --upload-port COM5   # Windows
+```
+
+Everything downstream of flashing — pairing over BLE, installing the daemon,
+the BLE protocol itself — is identical to the rest of this README. The
+differences worth knowing before you start:
+
+- **Hardware is different under the hood, but nothing you need to configure.**
+  This board has no AXP2101 PMU (battery % comes from a BQ27220 fuel gauge
+  instead) and no I/O expander (display/touch reset are direct GPIOs) — the
+  firmware handles all of that transparently; the daemon and pairing flow
+  don't change.
+- **Only one physical button — BOOT.** Stock hardware exposes BOOT + a
+  hardware RESET and nothing else (no second/PWR button like the AMOLED
+  boards). Holding BOOT sends Space (Claude Code voice-mode push-to-talk),
+  same as the "Left" button elsewhere in this README. There's no
+  Shift+Tab/mode-toggle button on this board.
+- **No PWR-driven splash cycling or brightness cycling.** Both are normally
+  triggered by a PWR button this board doesn't have. You can still switch
+  between the splash and Usage screens by tapping the touchscreen — that
+  still works normally.
+- **The hold-to-pair re-pair gesture doesn't work here either, for the same
+  reason.** First-time pairing is unaffected — an unbonded device advertises
+  immediately after flashing, so follow your OS's "Pair the device" steps
+  below as normal. But if you later want to re-pair with a *different* host,
+  there's currently no button gesture to clear the saved bond on this board.
+  Until that gets a proper fix, the reliable way to reset it is to erase the
+  board's flash and reflash:
+  ```bash
+  pio run -d firmware -e waveshare_lcd_185b -t erase
+  ./flash-mac.sh waveshare_lcd_185b   # or ./flash.sh / the Windows pio command above
+  ```
 
 ## Prerequisites
 
@@ -197,6 +270,10 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
 
 ## Physical buttons
+
+> On the round LCD-1.85B board this fork targets, only the **Left/BOOT** row
+> below applies — there's no Middle/PWR or Right button. See
+> [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) for specifics.
 
 The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
 
