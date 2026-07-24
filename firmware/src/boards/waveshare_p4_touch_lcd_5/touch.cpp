@@ -59,25 +59,63 @@ void touch_hal_init(void) {
     Serial.printf("Touch GT911 found at 0x%02X\n", gt911_addr);
 }
 
-void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
-    *pressed = false;
-    if (!gt911_addr) return;
-
+// Reads one point-1 record. Returns false if no fresh sample was available
+// (caller should NOT treat that as "not pressed" — it means "couldn't sample
+// right now", distinct from a real released touch).
+static bool gt911_read_point(uint16_t* out_x, uint16_t* out_y) {
     uint8_t status = 0;
-    if (!gt911_read(0x814E, &status, 1)) return;
-    if (!(status & 0x80)) return;  // no fresh data
+    if (!gt911_read(0x814E, &status, 1)) return false;
+    if (!(status & 0x80)) return false;  // no fresh data
 
     uint8_t points = status & 0x0F;
     if (points == 0 || points > 5) {
         gt911_write16(0x814E, 0x00);  // clear and bail
-        return;
+        return false;
     }
 
     uint8_t rec[8];
-    if (gt911_read(0x8150, rec, sizeof(rec))) {
-        *x = ((uint16_t)rec[1] << 8) | rec[2];
-        *y = ((uint16_t)rec[3] << 8) | rec[4];
+    bool ok = gt911_read(0x8150, rec, sizeof(rec));
+    gt911_write16(0x814E, 0x00);  // tell the controller we've consumed this sample
+    if (!ok) return false;
+    *out_x = ((uint16_t)rec[1] << 8) | rec[2];
+    *out_y = ((uint16_t)rec[3] << 8) | rec[4];
+    return true;
+}
+
+void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
+    *pressed = false;
+    if (!gt911_addr) return;
+
+    uint16_t x1, y1;
+    if (!gt911_read_point(&x1, &y1)) return;
+
+    // Second, independent sample taken immediately after the first — reject
+    // if they disagree by more than a small tolerance. This board's GT911 has
+    // no RST/INT pins wired, so touch_hal_read() polls raw registers with no
+    // controller-side debouncing; single-sample reads have been observed on
+    // real hardware to occasionally report wildly wrong coordinates (300+px
+    // off for a barely-moved finger) — most likely a torn I2C read or a
+    // stale/wrong multi-touch point slot, not real finger motion, since two
+    // genuine back-to-back samples of the same physical touch should closely
+    // agree. A dropped cycle here just means the next poll (milliseconds
+    // later) tries again — no functional loss for a real, held touch.
+    uint16_t x2, y2;
+    if (!gt911_read_point(&x2, &y2)) {
+        // No second sample available this instant — accept the first alone
+        // rather than dropping a legitimate touch outright.
+        *x = x1;
+        *y = y1;
+        *pressed = true;
+        return;
+    }
+
+    const uint16_t TOLERANCE = 40;
+    uint16_t dx = x1 > x2 ? x1 - x2 : x2 - x1;
+    uint16_t dy = y1 > y2 ? y1 - y2 : y2 - y1;
+    if (dx <= TOLERANCE && dy <= TOLERANCE) {
+        *x = x2;
+        *y = y2;
         *pressed = true;
     }
-    gt911_write16(0x814E, 0x00);  // tell the controller we've consumed this sample
+    // else: the two samples disagree too much — treat as noise, drop this cycle.
 }

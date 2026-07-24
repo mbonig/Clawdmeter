@@ -44,6 +44,11 @@
 #define BLE_BUF_SIZE 512
 #define MAX_TRACKED_BONDS 8
 
+// Second collection (Report ID 2, Consumer usage page 0x0C) is this board's
+// media/volume control bar (BoardCaps.has_media_controls) — a single 16-bit
+// usage-code selector, sent as the pressed code then 0x0000 to release. See
+// openspec/changes/add-media-volume-controls/design.md for why this shape
+// (array-of-1, not a bitmap) and why this board only.
 static const uint8_t HID_REPORT_MAP[] = {
     0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
     0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
@@ -54,11 +59,24 @@ static const uint8_t HID_REPORT_MAP[] = {
     0x91, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00,
     0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
     0x81, 0x00, 0xC0,
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x09, 0x01,        // Usage (Consumer Control)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x02,        //   Report ID (2)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,  //   Logical Maximum (0x3FF)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x2A, 0xFF, 0x03,  //   Usage Maximum (0x3FF)
+    0x75, 0x10,        //   Report Size (16)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x00,        //   Input (Data, Array, Absolute)
+    0xC0,              // End Collection
 };
 
 static BLEServer* server = nullptr;
 static BLEHIDDevice* hid_dev = nullptr;
 static BLECharacteristic* input_kbd = nullptr;
+static BLECharacteristic* input_consumer = nullptr;
 static BLECharacteristic* tx_char = nullptr;
 static BLECharacteristic* rx_char = nullptr;
 static BLECharacteristic* req_char = nullptr;
@@ -275,6 +293,7 @@ void ble_init(void) {
     hid_dev->hidInfo(33, 0x02);
     hid_dev->setBatteryLevel(100);
     input_kbd = hid_dev->inputReport(1);
+    input_consumer = hid_dev->inputReport(2);  // Consumer Control (media/volume)
     hid_dev->startServices();
 
     // --- Custom data service ---
@@ -402,4 +421,33 @@ void ble_keyboard_release(void) {
     uint8_t report[8] = {0};
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
+}
+
+// Real Consumer Control implementation — this board only (BoardCaps.has_media_controls).
+// Report is a single 16-bit little-endian usage-code selector (see HID_REPORT_MAP above):
+// send the usage code to press, 0x0000 to release.
+static uint16_t consumer_usage_code(ble_consumer_key_t key) {
+    switch (key) {
+        case BLE_CONSUMER_VOLUME_UP:   return 0x00E9;
+        case BLE_CONSUMER_VOLUME_DOWN: return 0x00EA;
+        case BLE_CONSUMER_MUTE:        return 0x00E2;
+        case BLE_CONSUMER_PLAY_PAUSE:  return 0x00CD;
+        case BLE_CONSUMER_NEXT_TRACK:  return 0x00B5;
+    }
+    return 0x0000;
+}
+
+void ble_consumer_press(ble_consumer_key_t key) {
+    if (state != BLE_STATE_CONNECTED || !input_consumer) return;
+    uint16_t code = consumer_usage_code(key);
+    uint8_t report[2] = {(uint8_t)(code & 0xFF), (uint8_t)(code >> 8)};
+    input_consumer->setValue(report, sizeof(report));
+    input_consumer->notify();
+}
+
+void ble_consumer_release(void) {
+    if (state != BLE_STATE_CONNECTED || !input_consumer) return;
+    uint8_t report[2] = {0, 0};
+    input_consumer->setValue(report, sizeof(report));
+    input_consumer->notify();
 }
