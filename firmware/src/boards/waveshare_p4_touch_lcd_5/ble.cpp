@@ -263,7 +263,15 @@ void ble_init(void) {
     // output is unreliable on this board's native USB CDC).
     hid_dev->manufacturer();
     hid_dev->manufacturer("Anthropic");
-    hid_dev->pnp(0x01, 0x02E5, 0x0001, 0x0100);
+    // BLEHIDDevice::pnp() packs each 16-bit field big-endian
+    // (high-byte-first) — confirmed by reading the implementation directly
+    // — but the Bluetooth SIG's PnP ID characteristic (0x2A50) spec requires
+    // little-endian. Confirmed on hardware via `system_profiler
+    // SPBluetoothDataType`: macOS showed Vendor ID 0xE502 / Product ID
+    // 0x0100 for values passed here as 0x02E5 / 0x0001 — exactly the
+    // byte-swapped result of this bug. Pre-swapping each field here so the
+    // buggy packer's output ends up correct.
+    hid_dev->pnp(0x01, 0xE502, 0x0100, 0x0001);
     hid_dev->hidInfo(33, 0x02);
     hid_dev->setBatteryLevel(100);
     input_kbd = hid_dev->inputReport(1);
