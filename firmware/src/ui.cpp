@@ -134,6 +134,19 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_28;
         L.bt_credit_1_font = &font_styrene_24;
         L.bt_credit_2_font = &font_styrene_20;
+        // make_usage_panel()'s placeholder "---%"/"---" labels read these
+        // directly — left unset here (and in "compact" below) until now, so
+        // they were always null on every existing board. Rendering a style
+        // with a null font pointer happened to be harmless on the Xtensa
+        // boards that have shipped so far, but hangs LVGL's renderer outright
+        // on ESP32-P4 (waveshare_p4_touch_lcd_5) — found while bringing that
+        // board up. ui_update() immediately overwrites pct_font with
+        // font_tiempos_56/font_styrene_48 once real data arrives (see the
+        // enterprise branch below), so font_styrene_48 here just means the
+        // brief pre-first-update placeholder matches the common (non-
+        // enterprise) case instead of flashing a different font.
+        L.pct_font   = &font_styrene_48;
+        L.reset_font = &font_styrene_20;
     } else if (c.height >= 300) {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
         L.content_y = 85;
@@ -148,6 +161,9 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_20;
         L.bt_credit_1_font = &font_styrene_16;
         L.bt_credit_2_font = &font_styrene_14;
+        // Same null-font-pointer fix as "large" above — see the comment there.
+        L.pct_font   = &font_styrene_48;
+        L.reset_font = &font_styrene_16;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
         // Everything shrinks: fonts two steps down, panels ~half height, and
