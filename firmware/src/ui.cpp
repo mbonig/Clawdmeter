@@ -139,6 +139,11 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 16;
         L.usage_bar_y = 56;
         L.usage_reset_y = 94;
+        // Without this the bar is created at zero height and is simply invisible —
+        // only the "small" branch below used to set it, so every board on the large
+        // and compact layouts silently had no progress bar at all. 22px sits inside
+        // the 38px gap between usage_bar_y and usage_reset_y.
+        L.bar_h = 22;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -202,6 +207,7 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
+        L.bar_h = 18;   // see the large branch — this was also unset (invisible bar)
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -395,7 +401,10 @@ static void set_gauge(lv_obj_t* gauge, int pct, lv_color_t color) {
 static lv_color_t pct_color(float pct) {
     if (pct >= 80.0f) return COL_RED;
     if (pct >= 50.0f) return COL_AMBER;
-    return L.is_round ? COL_TEAL : COL_GREEN;
+    // Teal on every board. The rectangular layouts used to use COL_GREEN here while
+    // only the round display used COL_TEAL — two different accent colours for the same
+    // element with no real reason, so they're unified on the round display's teal.
+    return COL_TEAL;
 }
 
 static void format_reset_time(int mins, char* buf, size_t len) {
@@ -439,7 +448,9 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_set_style_bg_color(bar, COL_BAR_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, COL_GREEN, LV_PART_INDICATOR);
+    // Initial fill colour before any data arrives; set_gauge() recolours per
+    // percentage. Matches the round display's arc indicator (see make_gauge_arc).
+    lv_obj_set_style_bg_color(bar, COL_TEAL, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
     return bar;
@@ -974,7 +985,7 @@ void ui_update(const UsageData* data) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
-        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? (L.is_round ? COL_TEAL : COL_GREEN) :
+        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? COL_TEAL :
                               (data->session_pct <= (float)data->time_pct + 15.0f) ? COL_AMBER :
                               COL_RED;
         set_gauge(bar_weekly, data->time_pct, bar_pace);
