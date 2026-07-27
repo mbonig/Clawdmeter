@@ -180,13 +180,14 @@ static void compute_layout(const BoardCaps& c) {
             // (likely compounded by touchscreen parallax). Bigger buttons
             // plus a generous dead-zone in global_click_cb (see there) are
             // the practical fix, not a coordinate transform.
-            L.control_btn_size = 88;
-            // Slightly taller than wide: costs nothing, and a little extra vertical
-            // slack is forgiving for a fingertip. Width stays at 88 so neighbouring
-            // buttons can't overlap (slots are only 104px apart — overlapping hit
-            // areas would fire the wrong media key, worse than a missed tap).
-            L.control_btn_h    = 104;
-            L.control_bar_h    = 130;
+            // Sized off the 720px width rather than fixed constants: 5 slots across
+            // (720 - 2*20) / 5 = 136, with a 124px round button leaving a 12px gap
+            // between neighbours. Now that touch coordinates are accurate there's no
+            // reason to keep the old 100px bezel inset (that was a workaround for a
+            // phantom X error — see touch.cpp), so the buttons get that space back.
+            L.control_btn_size = 124;
+            L.control_btn_h    = 124;   // circular
+            L.control_bar_h    = 150;
             // Bottom-anchored off scr_h rather than tied to the panel offsets: this
             // breakpoint's absolute panel constants were tuned for a 480-tall screen
             // and this board is 1280 tall, so anchoring off the top would strand the
@@ -578,13 +579,12 @@ static void build_control_bar(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(bar, 0, 0);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Inset from the screen edges rather than divided edge-to-edge, so the outer
-    // buttons aren't flush against the bezel. (An earlier comment here blamed an
-    // unreliable GT911 X-axis near the edges and claimed 100px was the minimum safe
-    // inset — that was the field-misread bug in this board's touch.cpp, since fixed;
-    // the margin is now purely cosmetic and free to change.)
+    // Small cosmetic inset so the outer buttons aren't flush against the bezel. (An
+    // earlier version used 100px here, blaming an unreliable GT911 X-axis near the
+    // edges — that was the field-misread bug in this board's touch.cpp, since fixed,
+    // so the margin is now purely cosmetic and the space goes to bigger buttons.)
     const int n = 5;
-    const int16_t side_margin = 100;
+    const int16_t side_margin = 20;
     int16_t usable_w = L.scr_w - 2 * side_margin;
     int16_t slot_w = usable_w / n;
     for (int i = 0; i < n; i++) {
@@ -607,6 +607,13 @@ static void build_control_bar(lv_obj_t* parent) {
 
         lv_obj_t* icon = lv_image_create(btn);
         lv_image_set_src(icon, &control_icon_dscs[i]);
+        // The source icons are 48px; scale them to about half the button so they stay
+        // proportionate as the button size changes (LVGL zoom: 256 = 1:1, and it zooms
+        // around the image's own centre, so lv_obj_center() below is unaffected).
+        int32_t icon_target = L.control_btn_size / 2;
+        if (icon_target > ICON_VOLUME_UP_W) {
+            lv_image_set_scale(icon, (256 * icon_target) / ICON_VOLUME_UP_W);
+        }
         lv_obj_center(icon);
     }
 }
