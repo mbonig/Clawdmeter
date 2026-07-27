@@ -57,7 +57,8 @@ struct Layout {
     // above it on a given board.
     int16_t control_bar_y;           // band top edge
     int16_t control_bar_h;           // band height
-    int16_t control_btn_size;        // per-button square size (touch target)
+    int16_t control_btn_size;        // per-button width (touch target)
+    int16_t control_btn_h;           // per-button height (taller: absorbs Y error)
     int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
     int16_t batt_y;                  // battery icon top edge
@@ -180,13 +181,17 @@ static void compute_layout(const BoardCaps& c) {
             // plus a generous dead-zone in global_click_cb (see there) are
             // the practical fix, not a coordinate transform.
             L.control_btn_size = 88;
+            // Slightly taller than wide: costs nothing, and a little extra vertical
+            // slack is forgiving for a fingertip. Width stays at 88 so neighbouring
+            // buttons can't overlap (slots are only 104px apart — overlapping hit
+            // areas would fire the wrong media key, worse than a missed tap).
+            L.control_btn_h    = 104;
             L.control_bar_h    = 130;
-            // Leave room below the bar for the status line, which is
-            // bottom-anchored independently (LV_ALIGN_BOTTOM_MID, see
-            // init_usage_screen) — this is not a trim of usage_panel_h
-            // (unnecessary here: this branch's absolute panel offsets were
-            // tuned for a 480-tall screen, and the one board with this flag
-            // is 1280 tall, so there's already ample room below the panels).
+            // Bottom-anchored off scr_h rather than tied to the panel offsets: this
+            // breakpoint's absolute panel constants were tuned for a 480-tall screen
+            // and this board is 1280 tall, so anchoring off the top would strand the
+            // bar mid-screen with hundreds of pixels of dead space below it. Leaves
+            // room for the independently bottom-anchored status line.
             L.control_bar_y = L.scr_h - L.control_bar_h - 70;
         }
     } else if (c.height >= 300) {
@@ -560,8 +565,12 @@ static void control_btn_event_cb(lv_event_t* e) {
     else                          ble_consumer_release();  // RELEASED or PRESS_LOST
 }
 
+static lv_obj_t* control_bar = nullptr;   // media/volume bar, owned by usage_container
+
+
 static void build_control_bar(lv_obj_t* parent) {
     lv_obj_t* bar = lv_obj_create(parent);
+    control_bar = bar;
     lv_obj_set_size(bar, L.scr_w, L.control_bar_h);
     lv_obj_set_pos(bar, 0, L.control_bar_y);
     lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
@@ -569,22 +578,21 @@ static void build_control_bar(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(bar, 0, 0);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Inset well past the screen edges, not divided edge-to-edge — real-hardware
-    // testing found the GT911's X-axis unreliable near the physical bezel on both
-    // sides (readings floor around x=100 on the left no matter how far left the
-    // tap is, and the two rightmost buttons read non-monotonically, both
-    // clamping/jittering near the right edge), while the panel center reads
-    // accurately. 100px side margins keep every button's center comfortably
-    // inside the verified-reliable window.
+    // Inset from the screen edges rather than divided edge-to-edge, so the outer
+    // buttons aren't flush against the bezel. (An earlier comment here blamed an
+    // unreliable GT911 X-axis near the edges and claimed 100px was the minimum safe
+    // inset — that was the field-misread bug in this board's touch.cpp, since fixed;
+    // the margin is now purely cosmetic and free to change.)
     const int n = 5;
     const int16_t side_margin = 100;
     int16_t usable_w = L.scr_w - 2 * side_margin;
     int16_t slot_w = usable_w / n;
     for (int i = 0; i < n; i++) {
         lv_obj_t* btn = lv_obj_create(bar);
-        lv_obj_set_size(btn, L.control_btn_size, L.control_btn_size);
+        int16_t btn_h = L.control_btn_h > 0 ? L.control_btn_h : L.control_btn_size;
+        lv_obj_set_size(btn, L.control_btn_size, btn_h);
         lv_obj_set_pos(btn, side_margin + slot_w * i + (slot_w - L.control_btn_size) / 2,
-                        (L.control_bar_h - L.control_btn_size) / 2);
+                        (L.control_bar_h - btn_h) / 2);
         lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
@@ -810,13 +818,26 @@ static void init_usage_screen(lv_obj_t* scr) {
                          &lbl_weekly_pct, &lbl_weekly_label,
                          &bar_weekly, &lbl_weekly_reset);
 
-        if (board_caps().has_media_controls) build_control_bar(usage_group);
+        // Parented to usage_container, NOT usage_group: the media/volume controls have
+        // nothing to do with usage data, but usage_group is hidden whenever data goes
+        // stale — which made the buttons disappear behind the idle "Listening…" screen
+        // exactly when you'd still want to change the volume. update_view_state() hides
+        // this only when BLE is down (the pairing view), where presses can't work anyway.
+        if (board_caps().has_media_controls) build_control_bar(usage_container);
     }
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
+
+    // pair_group/idle_group are created after the control bar and are both full-width
+    // panels covering everything below the header, so in LVGL's create-order z-stacking
+    // they sit ON TOP of the bar and silently swallow every tap aimed at it (the press
+    // hit idle_group, bubbled to usage_container, and global_click_cb's dead zone then
+    // dropped it — so nothing happened at all). Lift the bar back to the front so its
+    // buttons are actually hittable on the idle screen.
+    if (control_bar) lv_obj_move_foreground(control_bar);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
     lbl_anim = lv_label_create(usage_container);
@@ -983,6 +1004,12 @@ static void update_view_state(void) {
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                       LV_OBJ_FLAG_HIDDEN);
+    // Media controls stay usable whenever there's a link (live usage OR idle/stale
+    // data); only the pairing view hides them, since nothing can be sent with BLE down.
+    if (control_bar) {
+        if (v == 0) lv_obj_add_flag(control_bar, LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_clear_flag(control_bar, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void ui_tick_anim(void) {
@@ -1054,22 +1081,23 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    // Ignore taps anywhere near the media/volume control-bar band — a miss on
-    // one of its small buttons must not fall through to the "tap anywhere
-    // toggles splash" gesture. Checked by raw coordinate, not by which widget
-    // technically received the click, since that's robust regardless of the
-    // exact hit-test/bubbling path a near-miss takes through the widget tree.
-    // The margin above the bar is generous (not just the bar's own bounds) —
-    // real-hardware testing found "aim near the bottom" taps landing 150-300+
-    // px short of the actual target, so a tight bound would still let most
-    // near-misses through to the disruptive splash jump.
+    // Ignore taps inside the media/volume control-bar band, so a near-miss on one of
+    // its buttons doesn't fall through to the "tap anywhere toggles splash" gesture
+    // and yank the screen away. Checked by raw coordinate rather than by which widget
+    // received the click, so it holds regardless of the hit-test path a near-miss
+    // takes through the widget tree.
+    //
+    // The band is the bar's own bounds plus a small margin. It used to be 300px,
+    // compensating for taps that appeared to land 150-300px short — but that was the
+    // GT911 field-misread bug (see boards/waveshare_p4_touch_lcd_5/touch.cpp), not
+    // real aiming error. Coordinates are accurate now, so the huge dead zone is
+    // unnecessary and only made a large part of the screen mysteriously inert.
     if (board_caps().has_media_controls && L.control_bar_h > 0) {
         lv_indev_t* indev = lv_indev_active();
         if (indev) {
             lv_point_t p;
             lv_indev_get_point(indev, &p);
-            const int16_t dead_zone_top = L.control_bar_y - 300;
-            if (p.y >= dead_zone_top) return;
+            if (p.y >= L.control_bar_y - 20) return;
         }
     }
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);

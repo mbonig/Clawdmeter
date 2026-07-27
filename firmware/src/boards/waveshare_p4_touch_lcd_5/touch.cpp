@@ -17,10 +17,12 @@
 // contract's 5ms budget.
 //
 //   reg 0x814E: bit7 = data-ready, bits[3:0] = touch point count (0-5)
-//   reg 0x8150: point 1 record (8 bytes) — [track_id, xH, xL, yH, yL, sL, sH, rsvd]
-//   (high byte before low byte here — confirmed empirically on hardware;
-//   this unit's coordinate bytes are the opposite order from some published
-//   GT911 register maps, which list xL before xH.)
+//   reg 0x814F: point 1 record (8 bytes) — [track_id, xL, xH, yL, yH, sL, sH, rsvd]
+//   Little-endian coordinate pairs, record starting at 0x814F. Verified against
+//   Espressif's official esp_lcd_touch_gt911 component. An earlier version of this
+//   file read the record from 0x8150 and treated the pairs as big-endian, which
+//   silently mixed bytes from adjacent fields — see gt911_read_point() for the full
+//   story and why several "coordinate accuracy" workarounds were removed with it.
 
 static uint8_t gt911_addr = 0;
 
@@ -62,6 +64,31 @@ void touch_hal_init(void) {
 // Reads one point-1 record. Returns false if no fresh sample was available
 // (caller should NOT treat that as "not pressed" — it means "couldn't sample
 // right now", distinct from a real released touch).
+//
+// Register layout, verified against Espressif's official esp_lcd_touch_gt911
+// component (read from the sibling ESP-Streaming-Deck project's managed_components):
+//
+//   0x814E        status: bit7 = data ready, bits[3:0] = point count
+//   0x814F        point 1 track id
+//   0x8150/0x8151 point 1 X low / X high   (little-endian)
+//   0x8152/0x8153 point 1 Y low / Y high   (little-endian)
+//   0x8154/0x8155 point 1 size low / high
+//
+// This reader previously started the record read at 0x8150 and assumed *that* was the
+// track id, i.e. every field was shifted one byte, and it also treated the pairs as
+// big-endian. The result was that it combined bytes from adjacent fields:
+//   x = (X_high << 8) | Y_low          y = (Y_high << 8) | size_low
+// which is the true cause of the "mangled touch grid" chased for two sessions — the
+// compressed and genuinely non-monotonic X readings, and a Y that moved by only
+// ~10-15px across large finger movements (it was dominated by Y_high<<8, changing
+// only every 256px, plus the touch-size byte as noise). It also explains the earlier
+// "Y saturates near 1080" reading: y = (3 << 8) | size ≈ 768..1023 for anything in
+// the lower half of the panel.
+//
+// Everything built on top of that misreading has been removed: the empirical 5/4 X
+// scale factor (it was fitting garbage), and the "reject any report that isn't exactly
+// 1 point" + double-sample-agreement filters (both were attempts to suppress the
+// symptoms). Match the official driver instead.
 static bool gt911_read_point(uint16_t* out_x, uint16_t* out_y) {
     uint8_t status = 0;
     if (!gt911_read(0x814E, &status, 1)) return false;
@@ -74,11 +101,13 @@ static bool gt911_read_point(uint16_t* out_x, uint16_t* out_y) {
     }
 
     uint8_t rec[8];
-    bool ok = gt911_read(0x8150, rec, sizeof(rec));
+    bool ok = gt911_read(0x814F, rec, sizeof(rec));
     gt911_write16(0x814E, 0x00);  // tell the controller we've consumed this sample
     if (!ok) return false;
-    *out_x = ((uint16_t)rec[1] << 8) | rec[2];
-    *out_y = ((uint16_t)rec[3] << 8) | rec[4];
+
+    // rec[0] = track id, rec[1..2] = X (LE), rec[3..4] = Y (LE)
+    *out_x = (uint16_t)rec[1] | ((uint16_t)rec[2] << 8);
+    *out_y = (uint16_t)rec[3] | ((uint16_t)rec[4] << 8);
     return true;
 }
 
@@ -86,36 +115,16 @@ void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
     *pressed = false;
     if (!gt911_addr) return;
 
-    uint16_t x1, y1;
-    if (!gt911_read_point(&x1, &y1)) return;
+    // Single read is enough now that the register offset/byte order is correct. The
+    // previous double-sample "agreement" filter existed to suppress wildly wrong
+    // coordinates that were actually caused by the off-by-one field misread (see
+    // gt911_read_point above), and in practice its comparison almost never ran anyway:
+    // the first read clears the 0x814E status bit, so the immediate second read found
+    // no fresh data and fell through to a single-sample accept.
+    uint16_t rx, ry;
+    if (!gt911_read_point(&rx, &ry)) return;
 
-    // Second, independent sample taken immediately after the first — reject
-    // if they disagree by more than a small tolerance. This board's GT911 has
-    // no RST/INT pins wired, so touch_hal_read() polls raw registers with no
-    // controller-side debouncing; single-sample reads have been observed on
-    // real hardware to occasionally report wildly wrong coordinates (300+px
-    // off for a barely-moved finger) — most likely a torn I2C read or a
-    // stale/wrong multi-touch point slot, not real finger motion, since two
-    // genuine back-to-back samples of the same physical touch should closely
-    // agree. A dropped cycle here just means the next poll (milliseconds
-    // later) tries again — no functional loss for a real, held touch.
-    uint16_t x2, y2;
-    if (!gt911_read_point(&x2, &y2)) {
-        // No second sample available this instant — accept the first alone
-        // rather than dropping a legitimate touch outright.
-        *x = x1;
-        *y = y1;
-        *pressed = true;
-        return;
-    }
-
-    const uint16_t TOLERANCE = 40;
-    uint16_t dx = x1 > x2 ? x1 - x2 : x2 - x1;
-    uint16_t dy = y1 > y2 ? y1 - y2 : y2 - y1;
-    if (dx <= TOLERANCE && dy <= TOLERANCE) {
-        *x = x2;
-        *y = y2;
-        *pressed = true;
-    }
-    // else: the two samples disagree too much — treat as noise, drop this cycle.
+    *x = rx;
+    *y = ry;
+    *pressed = true;
 }

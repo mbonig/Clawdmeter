@@ -254,6 +254,13 @@ class ReqCallbacks : public BLECharacteristicCallbacks {
 
 void ble_init(void) {
     BLEDevice::init(DEVICE_NAME);
+    // SC (LE Secure Connections) is REQUIRED here, not optional: with SC disabled
+    // (legacy pairing) macOS pairs and even shows the device, but never attaches its
+    // HID stack — it never writes either report's CCCD, so every keyboard/consumer
+    // notify() is a silent no-op. Verified on hardware by toggling this one flag.
+    // The device must also be paired through the OS's own Bluetooth flow (which runs
+    // the "set up your keyboard" assistant); a CoreBluetooth app-level connect bonds
+    // for GATT access only and never enrolls HID.
     BLESecurity::setAuthenticationMode(true, false, true);  // bonding, no MITM, SC
 
     load_owner();
@@ -289,11 +296,40 @@ void ble_init(void) {
     // 0x0100 for values passed here as 0x02E5 / 0x0001 — exactly the
     // byte-swapped result of this bug. Pre-swapping each field here so the
     // buggy packer's output ends up correct.
-    hid_dev->pnp(0x01, 0xE502, 0x0100, 0x0001);
+    // Product ID is 0x0002 (this board previously advertised 0x0001). Bumped while
+    // chasing the HID bring-up bugs below, and deliberately kept: hosts cache HID
+    // descriptors per VID/PID, and the report map genuinely changed shape (a second
+    // input report was added), so presenting a new identity avoids serving stale
+    // cached descriptors to a host that already knew the old one. Bump it again if the
+    // report map ever changes shape again.
+    //
+    // Argument order confirmed by reading the raw PnP (0x2A50) characteristic bytes
+    // over BLE: pnp()'s 3rd arg is Product ID and the 4th is Product Version — the
+    // reverse of what an earlier comment here assumed. Each 16-bit field is still
+    // pre-swapped to cancel out the library's big-endian packing (see below).
+    hid_dev->pnp(0x01, 0xE502, 0x0200, 0x0001);
     hid_dev->hidInfo(33, 0x02);
     hid_dev->setBatteryLevel(100);
+    // Keyboard MUST be created first. arduino-esp32's bundled BLE library only ever
+    // registers ONE characteristic per UUID per service, and both HID input reports use
+    // UUID 0x2A4D — so whichever inputReport() is called *second* comes back as a live
+    // C++ object that was never added to the GATT database (handle stays 0xFFFF /
+    // NULL_HANDLE) and is invisible to the host.
+    //
+    // Proven on hardware with a controlled order-swap, reading handles off the on-screen
+    // debug label:
+    //   kbd first  -> h k=29    h c=65535
+    //   cons first -> h c=29    h k=65535
+    // The failure follows creation order, not the report's content. This is why the
+    // media buttons never worked: the host could not subscribe to a characteristic that
+    // does not exist, so every ble_consumer_press() notify was a silent no-op.
+    //
+    // Keyboard (Space / Shift+Tab from the physical BOOT button) is the feature that
+    // must keep working, so it gets the one usable slot. input_consumer stays non-null
+    // but unregistered; ble_consumer_press() therefore does nothing on the wire. See
+    // PROGRESS.md for the options to actually fix the media path.
     input_kbd = hid_dev->inputReport(1);
-    input_consumer = hid_dev->inputReport(2);  // Consumer Control (media/volume)
+    input_consumer = hid_dev->inputReport(2);  // NOT registered — see above
     hid_dev->startServices();
 
     // --- Custom data service ---
