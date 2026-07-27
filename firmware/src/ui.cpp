@@ -966,7 +966,7 @@ void ui_update(const UsageData* data) {
     if (data->session_pct > (float)data->time_pct + 15.0f) {
         pace_text = "Over pace";  pace_color = COL_RED;   pace_hex = "c0392b";
     } else if (data->session_pct > (float)data->time_pct - 15.0f) {
-        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "d97757";
+        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "e8734a";  // == THEME_AMBER
     }
 
     if (data->enterprise) {
