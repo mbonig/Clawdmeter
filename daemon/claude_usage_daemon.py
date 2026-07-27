@@ -214,10 +214,21 @@ async def retrieve_connected_macos(skip_addr: str | None = None):
     1. Peripherals connected under our CUSTOM service UUID. Membership in
        that service is unambiguous (no other device exposes it), so we accept
        by service alone — the peripheral's name can be None on macOS.
-    2. Fall back to the generic HID service 0x1812, but ONLY trust a
-       peripheral whose name matches DEVICE_NAME. 0x1812 also matches
-       unrelated keyboards/mice, so picking blindly here could grab the
-       wrong device.
+    2. Fall back to generic services the OS indexes for any accessory, but
+       ONLY trust a peripheral whose name matches DEVICE_NAME, since these
+       also match unrelated keyboards/mice/headphones.
+
+    Step 2 is not a nicety — it's the normal path once the device is paired
+    as a BLE HID keyboard (which it must be, for its buttons to work at all;
+    see the firmware's ble.cpp). Observed on macOS 26: with the device
+    genuinely connected and held by the OS, retrieveConnectedPeripheralsWithServices_
+    returns EMPTY for our custom service UUID and for 0x1812, but does return
+    it for 0x180A (Device Information) and 0x180F (Battery). macOS only
+    indexes services it has itself discovered, and it never does a full
+    service discovery on behalf of an app — while 0x1812 is deliberately
+    hidden from all app-level BLE clients. So the custom service is only
+    visible *after* we connect and discover, which is exactly what we can't
+    do until we've found the peripheral. Hence the generic-service fallback.
 
     ``skip_addr`` skips a peripheral whose UUID just failed to connect, so a
     stale CoreBluetooth handle can't trap us into never trying a fresh scan.
@@ -249,11 +260,17 @@ async def retrieve_connected_macos(skip_addr: str | None = None):
         if _ok(p):
             return _wrap(p)
 
-    # 2. Generic HID service — require an exact name match.
-    hid = cm.retrieveConnectedPeripheralsWithServices_(
-        [CBUUID.UUIDWithString_("1812")]
+    # 2. Generic services, name-matched. 0x1812 (HID) is listed first for the
+    #    ideal case, but in practice macOS hides it from apps and only 0x180A /
+    #    0x180F come back for a bonded HID keyboard — see the docstring.
+    fallback = cm.retrieveConnectedPeripheralsWithServices_(
+        [
+            CBUUID.UUIDWithString_("1812"),  # HID
+            CBUUID.UUIDWithString_("180A"),  # Device Information
+            CBUUID.UUIDWithString_("180F"),  # Battery
+        ]
     )
-    for p in hid or []:
+    for p in fallback or []:
         if _ok(p) and p.name() == DEVICE_NAME:
             return _wrap(p)
 

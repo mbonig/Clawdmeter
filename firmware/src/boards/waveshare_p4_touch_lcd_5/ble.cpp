@@ -330,9 +330,19 @@ void ble_init(void) {
     // PROGRESS.md for the options to actually fix the media path.
     input_kbd = hid_dev->inputReport(1);
     input_consumer = hid_dev->inputReport(2);  // NOT registered — see above
-    hid_dev->startServices();
 
     // --- Custom data service ---
+    // Registered BEFORE hid_dev->startServices(), because that call is what actually
+    // invokes BLEServer::start() and activates the whole GATT database. This used to be
+    // built afterwards and registered by a second server->start(), i.e. bolted onto an
+    // already-running GATT server, which needs a full re-registration to take effect
+    // properly on NimBLE.
+    //
+    // Symptom that this ordering caused: macOS could see the services from the first
+    // batch (Device Information 0x180A and Battery 0x180F — plus HID 0x1812, which it
+    // hides from apps) but NOT this custom service, so the daemon connected fine and
+    // then failed every write with "Characteristic ...0002 was not found". Exactly the
+    // first-batch/second-batch split.
     BLEService* svc = server->createService(SERVICE_UUID);
 
     rx_char = svc->createCharacteristic(
@@ -354,8 +364,8 @@ void ble_init(void) {
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
 
-    svc->start();
-    server->start();
+    svc->start();               // adds this service to the pending GATT database
+    hid_dev->startServices();   // adds DIS/HID/battery, then starts the server ONCE
     start_advertising();
 
     Serial.printf("BLE: init complete, MAC=%s\n", mac_str);
