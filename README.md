@@ -120,6 +120,31 @@ differences worth knowing before you start:
 - Windows: `python3` 3.11+ (the installer sets up a venv with `bleak`, `httpx`, and `pystray`)
 - Claude Code with an active subscription
 
+## Quick install — the daemon (macOS / Linux)
+
+If you just want the host daemon and don't need a clone to hack on, one line does it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mbonig/Clawdmeter/main/install-daemon.sh | sh
+```
+
+It detects your OS, fetches the repo to `~/.local/share/clawdmeter`, and runs the
+right platform installer for you (`install-mac.sh` on macOS, `install.sh` on Linux) —
+so everything the per-OS sections below describe still applies. Re-run the same
+command any time to update. The checkout has to stay put: the LaunchAgent/systemd
+unit references the daemon by absolute path inside it.
+
+Overrides:
+
+```bash
+CLAWDMETER_DIR=~/src/clawdmeter ...   # install somewhere else
+CLAWDMETER_REF=some-branch ...        # track a branch or tag instead of main
+```
+
+This installs the **host daemon only**. Flashing firmware to the board still needs
+PlatformIO and a USB cable — see your OS's "Flash the firmware" section below.
+Windows isn't covered by the one-liner; clone the repo and run `install-windows.ps1`.
+
 ## macOS installation
 
 The macOS host pieces — Python daemon, LaunchAgent, and flash helper — were ported by [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson). Thanks Chris!

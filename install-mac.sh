@@ -222,9 +222,18 @@ echo "  interactively once below. Press Ctrl+C after you see 'Scanning...'"
 echo "  and grant permission when prompted. Then re-run this installer"
 echo "  (or just continue) to enable launchd autostart."
 echo ""
-read -r -p "Run a permission-priming scan now? [Y/n] " ans
-if [[ ! "$ans" =~ ^[Nn]$ ]]; then
-    "$PYTHON_BIN" "$DAEMON_PY" || true
+# Only offer this with a real terminal. The scan runs in the foreground until
+# you Ctrl+C it, so a non-interactive run must skip it outright — otherwise the
+# installer hangs there forever and never reaches the launchd step.
+if [ -t 0 ]; then
+    read -r -p "Run a permission-priming scan now? [Y/n] " ans || ans=""
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+        "$PYTHON_BIN" "$DAEMON_PY" || true
+    fi
+else
+    echo "  Non-interactive shell — skipping. Grant Bluetooth access on the"
+    echo "  daemon's first launchd run, or prime it manually with:"
+    echo "    $PYTHON_BIN $DAEMON_PY"
 fi
 echo ""
 
