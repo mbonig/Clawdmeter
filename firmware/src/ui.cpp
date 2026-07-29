@@ -70,7 +70,6 @@ struct Layout {
 
     // Bluetooth screen
     int16_t bt_info_panel_h;
-    int16_t bt_reset_zone_h;
     const lv_font_t* bt_title_font;
     const lv_font_t* bt_status_font;
     const lv_font_t* bt_device_font;
@@ -145,7 +144,6 @@ static void compute_layout(const BoardCaps& c) {
         // the 38px gap between usage_bar_y and usage_reset_y.
         L.bar_h = 22;
         L.bt_info_panel_h = 160;
-        L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
         L.bt_status_font   = &font_styrene_48;
         L.bt_device_font   = &font_styrene_28;
@@ -209,7 +207,6 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_reset_y = 78;
         L.bar_h = 18;   // see the large branch — this was also unset (invisible bar)
         L.bt_info_panel_h = 140;
-        L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
         L.bt_status_font   = &font_styrene_28;
         L.bt_device_font   = &font_styrene_20;
@@ -256,7 +253,6 @@ static void compute_layout(const BoardCaps& c) {
         L.pair_y3 = 80;
         L.idle_px = 96;
         L.bt_info_panel_h = 90;
-        L.bt_reset_zone_h = 60;
         L.bt_title_font    = &font_tiempos_34;
         L.bt_status_font   = &font_styrene_20;
         L.bt_device_font   = &font_styrene_14;
