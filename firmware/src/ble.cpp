@@ -461,3 +461,11 @@ void ble_keyboard_release(void) {
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
 }
+
+// Deliberate no-op on every board that links this file — BoardCaps.has_media_controls
+// is false everywhere shared ble.cpp is used, so these are never reached in practice.
+// Real implementation (second HID report, Report ID 2, Consumer usage page) lives in
+// boards/waveshare_p4_touch_lcd_5/ble.cpp; mirror that report map here first if a
+// future board ever enables this flag on the NimBLE stack.
+void ble_consumer_press(ble_consumer_key_t key) { (void)key; }
+void ble_consumer_release(void) {}

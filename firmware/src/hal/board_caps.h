@@ -19,6 +19,7 @@ struct BoardCaps {
     bool    has_battery;     // AXP2101 battery measurement is meaningful
     bool    has_imu;         // QMI8658 (or compatible) is populated
     bool    is_round;        // circular panel — shared UI switches to a round-safe layout
+    bool    has_media_controls;  // renders the bottom media/volume touch bar on the usage screen
 };
 
 const BoardCaps& board_caps(void);

@@ -174,6 +174,10 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+            else if (strcmp(cmd_buf, "clearbonds") == 0) {
+                Serial.println("Clearing BLE bonds, advertising fresh");
+                ble_clear_bonds();
+            }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;

@@ -1,0 +1,10 @@
+MIT License
+
+Vendored from Waveshare's ESP32-P4-WIFI6-Touch-LCD-5 example repository:
+https://github.com/waveshareteam/ESP32-P4-WIFI6-Touch-LCD-5
+(examples/esp-idf/08_lvgl_demo_v9/components/esp_lcd_hx8394/)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files, to deal in the software
+without restriction, subject to the original license terms shipped by
+Waveshare alongside this component.

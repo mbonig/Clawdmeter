@@ -26,10 +26,15 @@ function safeIdent(s) {
 }
 
 // Brand override: claudepix renders the creature body in a lighter, pinker
-// terracotta (#CD7F6A) than Anthropic's brand terracotta. Remap it to the
-// brand color (THEME_ACCENT, #D97757) so the splash matches the brand.
+// terracotta (#CD7F6A) than Anthropic's brand terracotta. Remap it so the splash
+// creature matches the UI accent.
+//
+// The target MUST stay identical to THEME_ACCENT in firmware/src/theme.h — it's a
+// brightened terra-cotta (one step up in saturation/value from the brand #d97757,
+// which reads as drab on a true-black panel). If you change one, change both and
+// re-run this script to regenerate firmware/src/splash_animations.h.
 const TINT_OVERRIDE = {
-  '#cd7f6a': '#d97757',
+  '#cd7f6a': '#e8734a',
 };
 
 function hexToRgb565(hex) {

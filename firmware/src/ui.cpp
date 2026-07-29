@@ -47,6 +47,18 @@ struct Layout {
     const lv_font_t* anim_font;      // animated status line
     int16_t anim_y;                  // status line offset from bottom
     bool    small_icons;             // 40px logo + 24px battery (vs 80/48) on small screens
+
+    // Media/volume control bar (BoardCaps.has_media_controls — P4 only, see
+    // openspec/changes/add-media-volume-controls). Bottom-anchored off scr_h
+    // rather than tied to content_y/usage_panel_h, since the only board that
+    // sets the flag shares its breakpoint with boards tuned for a much
+    // shorter panel (480 vs. 1280) — anchoring off the bottom edge keeps the
+    // bar looking bottom-of-screen regardless of how much dead space sits
+    // above it on a given board.
+    int16_t control_bar_y;           // band top edge
+    int16_t control_bar_h;           // band height
+    int16_t control_btn_size;        // per-button width (touch target)
+    int16_t control_btn_h;           // per-button height (taller: absorbs Y error)
     int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
     int16_t batt_y;                  // battery icon top edge
@@ -127,6 +139,11 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 16;
         L.usage_bar_y = 56;
         L.usage_reset_y = 94;
+        // Without this the bar is created at zero height and is simply invisible —
+        // only the "small" branch below used to set it, so every board on the large
+        // and compact layouts silently had no progress bar at all. 22px sits inside
+        // the 38px gap between usage_bar_y and usage_reset_y.
+        L.bar_h = 22;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -134,6 +151,55 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_28;
         L.bt_credit_1_font = &font_styrene_24;
         L.bt_credit_2_font = &font_styrene_20;
+        // make_usage_panel()'s placeholder "---%"/"---" labels read these
+        // directly — left unset here (and in "compact" below) until now, so
+        // they were always null on every existing board. Rendering a style
+        // with a null font pointer happened to be harmless on the Xtensa
+        // boards that have shipped so far, but hangs LVGL's renderer outright
+        // on ESP32-P4 (waveshare_p4_touch_lcd_5) — found while bringing that
+        // board up. ui_update() immediately overwrites pct_font with
+        // font_tiempos_56/font_styrene_48 once real data arrives (see the
+        // enterprise branch below), so font_styrene_48 here just means the
+        // brief pre-first-update placeholder matches the common (non-
+        // enterprise) case instead of flashing a different font.
+        L.pct_font   = &font_styrene_48;
+        L.reset_font = &font_styrene_20;
+        // Same class of bug as the null pct_font/reset_font above: idle_px was
+        // never set on this breakpoint (or "compact" below), so splash_mini_create()
+        // received px=0, floored its cell size to the 1px minimum, and rendered
+        // the sleeping-creature idle screen as a 20x20px dot instead of a real
+        // creature. Harmless-looking on every board that's shipped so far only
+        // because the connected-but-no-data "idle" state is normally transient —
+        // found here because the P4 sat in it long enough (mid BLE-reconnect
+        // debugging) to actually look at it.
+        L.idle_px = 160;
+        if (c.has_media_controls) {
+            // Sized generously on real-hardware evidence: two separate
+            // deliberate "tap near the bottom" attempts landed hundreds of
+            // pixels short (measured y=805 and y=1079 against an intended
+            // target around y=1120-1210), while a top-of-screen calibration
+            // tap landed pixel-perfect — ruling out an axis swap/scale bug
+            // (GT911's own reported resolution is exactly 720x1280, matching
+            // the panel) and pointing instead at plain human aiming variance
+            // near an unfamiliar small target close to a screen edge
+            // (likely compounded by touchscreen parallax). Bigger buttons
+            // plus a generous dead-zone in global_click_cb (see there) are
+            // the practical fix, not a coordinate transform.
+            // Sized off the 720px width rather than fixed constants: 5 slots across
+            // (720 - 2*20) / 5 = 136, with a 124px round button leaving a 12px gap
+            // between neighbours. Now that touch coordinates are accurate there's no
+            // reason to keep the old 100px bezel inset (that was a workaround for a
+            // phantom X error — see touch.cpp), so the buttons get that space back.
+            L.control_btn_size = 124;
+            L.control_btn_h    = 124;   // circular
+            L.control_bar_h    = 150;
+            // Bottom-anchored off scr_h rather than tied to the panel offsets: this
+            // breakpoint's absolute panel constants were tuned for a 480-tall screen
+            // and this board is 1280 tall, so anchoring off the top would strand the
+            // bar mid-screen with hundreds of pixels of dead space below it. Leaves
+            // room for the independently bottom-anchored status line.
+            L.control_bar_y = L.scr_h - L.control_bar_h - 70;
+        }
     } else if (c.height >= 300) {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
         L.content_y = 85;
@@ -141,6 +207,7 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
+        L.bar_h = 18;   // see the large branch — this was also unset (invisible bar)
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -148,6 +215,11 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_20;
         L.bt_credit_1_font = &font_styrene_16;
         L.bt_credit_2_font = &font_styrene_14;
+        // Same null-font-pointer fix as "large" above — see the comment there.
+        L.pct_font   = &font_styrene_48;
+        L.reset_font = &font_styrene_16;
+        // Same idle_px fix as "large" above — see that comment.
+        L.idle_px = 140;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
         // Everything shrinks: fonts two steps down, panels ~half height, and
@@ -240,6 +312,9 @@ static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
+// ---- Media/volume control bar (BoardCaps.has_media_controls) ----
+static lv_image_dsc_t control_icon_dscs[5];  // vol down, mute, vol up, play/pause, next
+
 // ---- Live-data freshness → which usage sub-view to show ----
 // usage panels when data is flowing, an idle "Zzz" screen when the host is
 // connected but no usage update landed within DATA_FRESH_MS, the pairing hint
@@ -326,7 +401,10 @@ static void set_gauge(lv_obj_t* gauge, int pct, lv_color_t color) {
 static lv_color_t pct_color(float pct) {
     if (pct >= 80.0f) return COL_RED;
     if (pct >= 50.0f) return COL_AMBER;
-    return L.is_round ? COL_TEAL : COL_GREEN;
+    // Teal on every board. The rectangular layouts used to use COL_GREEN here while
+    // only the round display used COL_TEAL — two different accent colours for the same
+    // element with no real reason, so they're unified on the round display's teal.
+    return COL_TEAL;
 }
 
 static void format_reset_time(int mins, char* buf, size_t len) {
@@ -370,7 +448,9 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_set_style_bg_color(bar, COL_BAR_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, COL_GREEN, LV_PART_INDICATOR);
+    // Initial fill colour before any data arrives; set_gauge() recolours per
+    // percentage. Matches the round display's arc indicator (see make_gauge_arc).
+    lv_obj_set_style_bg_color(bar, COL_TEAL, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
     return bar;
@@ -470,6 +550,83 @@ static void init_battery_icons(void) {
     init_icon_dsc_rgb565a8(&battery_dscs[2], ICON_BATTERY_MEDIUM_W, ICON_BATTERY_MEDIUM_H, icon_battery_medium_data);
     init_icon_dsc_rgb565a8(&battery_dscs[3], ICON_BATTERY_FULL_W, ICON_BATTERY_FULL_H, icon_battery_full_data);
     init_icon_dsc_rgb565a8(&battery_dscs[4], ICON_BATTERY_CHARGING_W, ICON_BATTERY_CHARGING_H, icon_battery_charging_data);
+}
+
+// Order matches the on-screen left-to-right button order: Vol-, Mute, Vol+, Play/Pause, Next.
+static const ble_consumer_key_t CONTROL_BAR_KEYS[5] = {
+    BLE_CONSUMER_VOLUME_DOWN, BLE_CONSUMER_MUTE, BLE_CONSUMER_VOLUME_UP,
+    BLE_CONSUMER_PLAY_PAUSE, BLE_CONSUMER_NEXT_TRACK,
+};
+
+static void init_control_bar_icons(void) {
+    init_icon_dsc_rgb565a8(&control_icon_dscs[0], ICON_VOLUME_DOWN_W, ICON_VOLUME_DOWN_H, icon_volume_down_data);
+    init_icon_dsc_rgb565a8(&control_icon_dscs[1], ICON_VOLUME_X_W, ICON_VOLUME_X_H, icon_volume_x_data);
+    init_icon_dsc_rgb565a8(&control_icon_dscs[2], ICON_VOLUME_UP_W, ICON_VOLUME_UP_H, icon_volume_up_data);
+    init_icon_dsc_rgb565a8(&control_icon_dscs[3], ICON_PLAY_PAUSE_W, ICON_PLAY_PAUSE_H, icon_play_pause_data);
+    init_icon_dsc_rgb565a8(&control_icon_dscs[4], ICON_NEXT_TRACK_W, ICON_NEXT_TRACK_H, icon_next_track_data);
+}
+
+// Buttons are plain lv_obj_t (not lv_btn_create()), matching this file's existing
+// hand-styled-panel convention. Deliberately NOT given LV_OBJ_FLAG_EVENT_BUBBLE, so a
+// tap here never reaches usage_container's global_click_cb (splash/idle toggle).
+static void control_btn_event_cb(lv_event_t* e) {
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+    ble_consumer_key_t key = (ble_consumer_key_t)(intptr_t)lv_obj_get_user_data(btn);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) ble_consumer_press(key);
+    else                          ble_consumer_release();  // RELEASED or PRESS_LOST
+}
+
+static lv_obj_t* control_bar = nullptr;   // media/volume bar, owned by usage_container
+
+
+static void build_control_bar(lv_obj_t* parent) {
+    lv_obj_t* bar = lv_obj_create(parent);
+    control_bar = bar;
+    lv_obj_set_size(bar, L.scr_w, L.control_bar_h);
+    lv_obj_set_pos(bar, 0, L.control_bar_y);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Small cosmetic inset so the outer buttons aren't flush against the bezel. (An
+    // earlier version used 100px here, blaming an unreliable GT911 X-axis near the
+    // edges — that was the field-misread bug in this board's touch.cpp, since fixed,
+    // so the margin is now purely cosmetic and the space goes to bigger buttons.)
+    const int n = 5;
+    const int16_t side_margin = 20;
+    int16_t usable_w = L.scr_w - 2 * side_margin;
+    int16_t slot_w = usable_w / n;
+    for (int i = 0; i < n; i++) {
+        lv_obj_t* btn = lv_obj_create(bar);
+        int16_t btn_h = L.control_btn_h > 0 ? L.control_btn_h : L.control_btn_size;
+        lv_obj_set_size(btn, L.control_btn_size, btn_h);
+        lv_obj_set_pos(btn, side_margin + slot_w * i + (slot_w - L.control_btn_size) / 2,
+                        (L.control_bar_h - btn_h) / 2);
+        lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_user_data(btn, (void*)(intptr_t)CONTROL_BAR_KEYS[i]);
+        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESSED, NULL);
+        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_RELEASED, NULL);
+        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESS_LOST, NULL);
+
+        lv_obj_t* icon = lv_image_create(btn);
+        lv_image_set_src(icon, &control_icon_dscs[i]);
+        // The source icons are 48px; scale them to about half the button so they stay
+        // proportionate as the button size changes (LVGL zoom: 256 = 1:1, and it zooms
+        // around the image's own centre, so lv_obj_center() below is unaffected).
+        int32_t icon_target = L.control_btn_size / 2;
+        if (icon_target > ICON_VOLUME_UP_W) {
+            lv_image_set_scale(icon, (256 * icon_target) / ICON_VOLUME_UP_W);
+        }
+        lv_obj_center(icon);
+    }
 }
 
 // ======== Usage Screen ========
@@ -678,12 +835,27 @@ static void init_usage_screen(lv_obj_t* scr) {
                          L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
                          &lbl_weekly_pct, &lbl_weekly_label,
                          &bar_weekly, &lbl_weekly_reset);
+
+        // Parented to usage_container, NOT usage_group: the media/volume controls have
+        // nothing to do with usage data, but usage_group is hidden whenever data goes
+        // stale — which made the buttons disappear behind the idle "Listening…" screen
+        // exactly when you'd still want to change the volume. update_view_state() hides
+        // this only when BLE is down (the pairing view), where presses can't work anyway.
+        if (board_caps().has_media_controls) build_control_bar(usage_container);
     }
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
+
+    // pair_group/idle_group are created after the control bar and are both full-width
+    // panels covering everything below the header, so in LVGL's create-order z-stacking
+    // they sit ON TOP of the bar and silently swallow every tap aimed at it (the press
+    // hit idle_group, bubbled to usage_container, and global_click_cb's dead zone then
+    // dropped it — so nothing happened at all). Lift the bar back to the front so its
+    // buttons are actually hittable on the idle screen.
+    if (control_bar) lv_obj_move_foreground(control_bar);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
     lbl_anim = lv_label_create(usage_container);
@@ -699,6 +871,7 @@ static void init_usage_screen(lv_obj_t* scr) {
         lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
         lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
     }
+
 }
 
 // ======== Public API ========
@@ -713,6 +886,7 @@ void ui_init(void) {
     if (L.small_icons) init_icon_dsc_rgb565a8(&logo_dsc, LOGO_SMALL_WIDTH, LOGO_SMALL_HEIGHT, logo_small_data);
     else               init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
     init_battery_icons();
+    if (board_caps().has_media_controls) init_control_bar_icons();
 
     init_usage_screen(scr);
     splash_init(scr);
@@ -792,7 +966,7 @@ void ui_update(const UsageData* data) {
     if (data->session_pct > (float)data->time_pct + 15.0f) {
         pace_text = "Over pace";  pace_color = COL_RED;   pace_hex = "c0392b";
     } else if (data->session_pct > (float)data->time_pct - 15.0f) {
-        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "d97757";
+        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "e8734a";  // == THEME_AMBER
     }
 
     if (data->enterprise) {
@@ -811,7 +985,7 @@ void ui_update(const UsageData* data) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
-        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? (L.is_round ? COL_TEAL : COL_GREEN) :
+        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? COL_TEAL :
                               (data->session_pct <= (float)data->time_pct + 15.0f) ? COL_AMBER :
                               COL_RED;
         set_gauge(bar_weekly, data->time_pct, bar_pace);
@@ -848,6 +1022,12 @@ static void update_view_state(void) {
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                       LV_OBJ_FLAG_HIDDEN);
+    // Media controls stay usable whenever there's a link (live usage OR idle/stale
+    // data); only the pairing view hides them, since nothing can be sent with BLE down.
+    if (control_bar) {
+        if (v == 0) lv_obj_add_flag(control_bar, LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_clear_flag(control_bar, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void ui_tick_anim(void) {
@@ -919,6 +1099,25 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    // Ignore taps inside the media/volume control-bar band, so a near-miss on one of
+    // its buttons doesn't fall through to the "tap anywhere toggles splash" gesture
+    // and yank the screen away. Checked by raw coordinate rather than by which widget
+    // received the click, so it holds regardless of the hit-test path a near-miss
+    // takes through the widget tree.
+    //
+    // The band is the bar's own bounds plus a small margin. It used to be 300px,
+    // compensating for taps that appeared to land 150-300px short — but that was the
+    // GT911 field-misread bug (see boards/waveshare_p4_touch_lcd_5/touch.cpp), not
+    // real aiming error. Coordinates are accurate now, so the huge dead zone is
+    // unnecessary and only made a large part of the screen mysteriously inert.
+    if (board_caps().has_media_controls && L.control_bar_h > 0) {
+        lv_indev_t* indev = lv_indev_active();
+        if (indev) {
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+            if (p.y >= L.control_bar_y - 20) return;
+        }
+    }
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
