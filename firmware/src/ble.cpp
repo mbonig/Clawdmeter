@@ -118,23 +118,33 @@ static void load_owner() {
 }
 
 // Delete every stored bond that isn't the owner, so the board stays paired to
-// exactly one machine. Removing a bond shifts the indices, so restart from 0.
+// exactly one machine. Deleting shifts the remaining entries down into the
+// current index, so only advance when an entry is kept.
+//
+// deleteBond() can fail (it's ble_gap_unpair() != 0), and a bond NimBLE will
+// enumerate but refuse to remove used to wedge this: the old version rescanned
+// from index 0 after every delete and flagged progress without checking the
+// result, so one undeletable entry looped forever. Seen on hardware at 126k
+// iterations and climbing — and this runs inside onAuthenticationComplete AND
+// at boot from ble_init(), so the bad case is a board that never finishes
+// booting. Skipping a failed entry keeps the scan finite: every iteration
+// either removes a bond or steps past one.
 static void prune_foreign_bonds() {
     if (!owner_set) return;
-    bool removed;
-    do {
-        removed = false;
-        int n = NimBLEDevice::getNumBonds();
-        for (int i = 0; i < n; i++) {
-            NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-            if (strcmp(a.toString().c_str(), owner_addr) != 0) {
-                Serial.printf("BLE: pruning non-owner bond %s\n", a.toString().c_str());
-                NimBLEDevice::deleteBond(a);
-                removed = true;
-                break;
-            }
+    for (int i = 0; i < NimBLEDevice::getNumBonds(); ) {
+        NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+        if (strcmp(a.toString().c_str(), owner_addr) == 0) {
+            i++;  // the owner's own bond — keep it
+            continue;
         }
-    } while (removed);
+        if (NimBLEDevice::deleteBond(a)) {
+            Serial.printf("BLE: pruned non-owner bond %s\n", a.toString().c_str());
+        } else {
+            Serial.printf("BLE: FAILED to prune non-owner bond %s — skipping\n",
+                a.toString().c_str());
+            i++;
+        }
+    }
 }
 
 static void claim_owner(const std::string& id) {
@@ -144,6 +154,34 @@ static void claim_owner(const std::string& id) {
     save_owner();
     Serial.printf("BLE: owner claimed = %s\n", owner_addr);
     prune_foreign_bonds();
+}
+
+// Is the owner machine currently connected over an encrypted link?
+//
+// This is what separates a legitimate handoff from an interloper. BLE gives a
+// peripheral no notification when a central forgets its bond — nothing goes
+// over the air — so the board can never directly observe "I was unpaired".
+// The closest observable proxy is a *fresh successful bonding*, which already
+// required a human to initiate pairing from the new machine.
+//
+// So: if the owner isn't here, treat a new machine's pairing as the user
+// handing the board over, and transfer. If the owner IS here and encrypted,
+// the pairing is someone muscling in alongside it — reject, which is the case
+// the single-owner lock actually exists to stop (a second daemon in range
+// rotating the display to a foreign account).
+//
+// Encrypted-only on purpose: peer_id_addr is only trustworthy once the link is
+// encrypted, so an unencrypted peer can't hold the board hostage by merely
+// claiming the owner's address.
+static bool owner_is_connected() {
+    if (!owner_set || server == nullptr) return false;
+    uint8_t n = server->getConnectedCount();
+    for (uint8_t i = 0; i < n; i++) {
+        NimBLEConnInfo peer = server->getPeerInfo(i);
+        if (!peer.isEncrypted()) continue;
+        if (strcmp(peer.getIdAddress().toString().c_str(), owner_addr) == 0) return true;
+    }
+    return false;
 }
 
 static void start_advertising() {
@@ -251,9 +289,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         if (!owner_set) {
             claim_owner(id);
         } else if (strcmp(id.c_str(), owner_addr) != 0) {
-            Serial.printf("BLE: rejecting non-owner %s (owner=%s)\n", id.c_str(), owner_addr);
-            NimBLEDevice::deleteBond(info.getIdAddress());
-            server->disconnect(info);
+            if (owner_is_connected()) {
+                Serial.printf("BLE: rejecting non-owner %s (owner=%s is connected)\n",
+                    id.c_str(), owner_addr);
+                NimBLEDevice::deleteBond(info.getIdAddress());
+                server->disconnect(info);
+            } else {
+                // Owner absent + a human just paired this machine = handoff.
+                // claim_owner() prunes the old owner's bond on the way out.
+                Serial.printf("BLE: ownership handoff %s -> %s\n", owner_addr, id.c_str());
+                claim_owner(id);
+            }
         }
     }
 

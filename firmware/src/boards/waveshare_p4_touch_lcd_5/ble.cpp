@@ -153,6 +153,36 @@ static void claim_owner(const String& id) {
     prune_foreign_bonds();
 }
 
+// Is the owner machine currently connected over an encrypted link? Mirrors
+// shared ble.cpp's helper of the same name — see there for why the ownership
+// rule yields at all (BLE never tells a peripheral it was forgotten, so the
+// closest observable proxy for "a human just attached this to a new host" is a
+// fresh bonded, encrypted session from a different machine).
+//
+// Two differences forced by the bundled library. It has no per-connection
+// address accessor, so the connection handles come from its own peer map —
+// never guessed as sequential integers — and the descriptor is fetched through
+// NimBLE's C API. And with no onAuthenticationComplete hook, the caller is
+// onWrite rather than a pairing callback, so the writer's own handle is
+// excluded: it's the candidate, not evidence the owner is present.
+//
+// Encrypted-only on purpose: peer_id_addr is meaningless before encryption, so
+// an unencrypted peer can't block a handoff by claiming the owner's address.
+static bool owner_is_connected(uint16_t exclude_handle) {
+    if (!owner_set || server == nullptr) return false;
+    for (const auto& kv : server->getPeerDevices(false)) {
+        uint16_t handle = kv.first;
+        if (handle == exclude_handle) continue;
+        struct ble_gap_conn_desc d;
+        if (ble_gap_conn_find(handle, &d) != 0) continue;
+        if (!d.sec_state.encrypted) continue;
+        if (strcmp(BLEAddress(d.peer_id_addr).toString().c_str(), owner_addr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void arm_conn_param_pushback(uint16_t conn_handle, uint16_t timeout) {
     if (timeout < DESIRED_TIMEOUT && conn_handle != param_fix_spent) {
         param_fix_handle = conn_handle;
@@ -231,8 +261,15 @@ class RxCallbacks : public BLECharacteristicCallbacks {
             claim_owner(id);
         }
         if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
-            Serial.printf("BLE: dropping RX write from non-owner %s\n", id.c_str());
-            return;
+            if (id == ZERO_ADDR || owner_is_connected(desc->conn_handle)) {
+                Serial.printf("BLE: dropping RX write from non-owner %s (owner=%s)\n",
+                    id.c_str(), owner_addr);
+                return;
+            }
+            // Owner absent and a bonded machine is writing = handoff. Falls
+            // through so this write is accepted by its new owner.
+            Serial.printf("BLE: ownership handoff %s -> %s\n", owner_addr, id.c_str());
+            claim_owner(id);
         }
         String val = chr->getValue();
         size_t len = std::min((size_t)val.length(), (size_t)(BLE_BUF_SIZE - 1));
