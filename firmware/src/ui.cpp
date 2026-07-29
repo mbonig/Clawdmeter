@@ -56,9 +56,9 @@ struct Layout {
     // bar looking bottom-of-screen regardless of how much dead space sits
     // above it on a given board.
     int16_t control_bar_y;           // band top edge
-    int16_t control_bar_h;           // band height
-    int16_t control_btn_size;        // per-button width (touch target)
-    int16_t control_btn_h;           // per-button height (taller: absorbs Y error)
+    int16_t control_bar_h;           // band height (both rows)
+    int16_t control_btn_h;           // per-button height, shared by both rows
+    int16_t control_btn_gap;         // gutter between neighbouring buttons
     int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
     int16_t batt_y;                  // battery icon top edge
@@ -172,25 +172,18 @@ static void compute_layout(const BoardCaps& c) {
         // debugging) to actually look at it.
         L.idle_px = 160;
         if (c.has_media_controls) {
-            // Sized generously on real-hardware evidence: two separate
-            // deliberate "tap near the bottom" attempts landed hundreds of
-            // pixels short (measured y=805 and y=1079 against an intended
-            // target around y=1120-1210), while a top-of-screen calibration
-            // tap landed pixel-perfect — ruling out an axis swap/scale bug
-            // (GT911's own reported resolution is exactly 720x1280, matching
-            // the panel) and pointing instead at plain human aiming variance
-            // near an unfamiliar small target close to a screen edge
-            // (likely compounded by touchscreen parallax). Bigger buttons
-            // plus a generous dead-zone in global_click_cb (see there) are
-            // the practical fix, not a coordinate transform.
-            // Sized off the 720px width rather than fixed constants: 5 slots across
-            // (720 - 2*20) / 5 = 136, with a 124px round button leaving a 12px gap
-            // between neighbours. Now that touch coordinates are accurate there's no
-            // reason to keep the old 100px bezel inset (that was a workaround for a
-            // phantom X error — see touch.cpp), so the buttons get that space back.
-            L.control_btn_size = 124;
-            L.control_btn_h    = 124;   // circular
-            L.control_bar_h    = 150;
+            // Two rows of big edge-to-edge rectangles, sized as fractions of the
+            // screen width rather than absolute pixels so the proportions hold on
+            // any board that sets the flag:
+            //   row 0 — volume: Vol- / Mute / Vol+, a third of the width each
+            //   row 1 — transport: Play-Pause / Next, half the width each
+            // Height comes from the *bottom* row (half its own button width) and
+            // both rows share it, so every button is the same height and the
+            // shorter volume buttons don't end up stubby. At 720 wide that's
+            // 360x180 transport buttons and 240x180 volume buttons.
+            L.control_btn_gap = 6;
+            L.control_btn_h   = (L.scr_w / 2) / 2;
+            L.control_bar_h   = 2 * L.control_btn_h;
             // Bottom-anchored off scr_h rather than tied to the panel offsets: this
             // breakpoint's absolute panel constants were tuned for a 480-tall screen
             // and this board is 1280 tall, so anchoring off the top would strand the
@@ -586,42 +579,56 @@ static void build_control_bar(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(bar, 0, 0);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Small cosmetic inset so the outer buttons aren't flush against the bezel. (An
-    // earlier version used 100px here, blaming an unreliable GT911 X-axis near the
-    // edges — that was the field-misread bug in this board's touch.cpp, since fixed,
-    // so the margin is now purely cosmetic and the space goes to bigger buttons.)
-    const int n = 5;
-    const int16_t side_margin = 20;
-    int16_t usable_w = L.scr_w - 2 * side_margin;
-    int16_t slot_w = usable_w / n;
-    for (int i = 0; i < n; i++) {
-        lv_obj_t* btn = lv_obj_create(bar);
-        int16_t btn_h = L.control_btn_h > 0 ? L.control_btn_h : L.control_btn_size;
-        lv_obj_set_size(btn, L.control_btn_size, btn_h);
-        lv_obj_set_pos(btn, side_margin + slot_w * i + (slot_w - L.control_btn_size) / 2,
-                        (L.control_bar_h - btn_h) / 2);
-        lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_user_data(btn, (void*)(intptr_t)CONTROL_BAR_KEYS[i]);
-        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESSED, NULL);
-        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_RELEASED, NULL);
-        lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    // Buttons tile the full width edge-to-edge, in the row order CONTROL_BAR_KEYS
+    // already uses: three volume keys, then the two transport keys. The gutter is
+    // carved out of each slot rather than added between slots, so "a third" and
+    // "a half" stay exact and both rows stay flush with the screen edges. (An
+    // earlier version inset the whole bar by 100px, blaming an unreliable GT911
+    // X-axis near the edges — that was the field-misread bug in this board's
+    // touch.cpp, since fixed, so the space now goes to the buttons.)
+    const int row_counts[2] = { 3, 2 };
+    const int16_t gap = L.control_btn_gap;
+    int key_idx = 0;
+    for (int row = 0; row < 2; row++) {
+        const int n = row_counts[row];
+        const int16_t slot_w = L.scr_w / n;
+        const int16_t row_y  = row * L.control_btn_h;
+        for (int i = 0; i < n; i++, key_idx++) {
+            const int16_t x = slot_w * i;
+            // The last slot in a row takes the rounding remainder, so an odd screen
+            // width can't leave a sliver of background down the right edge.
+            const int16_t w = (i == n - 1) ? (int16_t)(L.scr_w - x) : slot_w;
 
-        lv_obj_t* icon = lv_image_create(btn);
-        lv_image_set_src(icon, &control_icon_dscs[i]);
-        // The source icons are 48px; scale them to about half the button so they stay
-        // proportionate as the button size changes (LVGL zoom: 256 = 1:1, and it zooms
-        // around the image's own centre, so lv_obj_center() below is unaffected).
-        int32_t icon_target = L.control_btn_size / 2;
-        if (icon_target > ICON_VOLUME_UP_W) {
-            lv_image_set_scale(icon, (256 * icon_target) / ICON_VOLUME_UP_W);
+            lv_obj_t* btn = lv_obj_create(bar);
+            lv_obj_set_size(btn, w - gap, L.control_btn_h - gap);
+            lv_obj_set_pos(btn, x + gap / 2, row_y + gap / 2);
+            lv_obj_set_style_radius(btn, 8, 0);   // matches make_panel's corner
+            lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
+            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(btn, 0, 0);
+            lv_obj_set_style_pad_all(btn, 0, 0);
+            lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_user_data(btn, (void*)(intptr_t)CONTROL_BAR_KEYS[key_idx]);
+            lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESSED, NULL);
+            lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_RELEASED, NULL);
+            lv_obj_add_event_cb(btn, control_btn_event_cb, LV_EVENT_PRESS_LOST, NULL);
+
+            lv_obj_t* icon = lv_image_create(btn);
+            lv_image_set_src(icon, &control_icon_dscs[key_idx]);
+            // Scale off the shared button *height*, not width, so all five glyphs
+            // render at one size even though the rows have different widths.
+            // Capped at 1.5x the 48px source: past that the upscale of a bitmap
+            // icon starts to look visibly blocky. (LVGL zoom: 256 = 1:1, applied
+            // around the image's own centre, so lv_obj_center() is unaffected.)
+            int32_t icon_target = (L.control_btn_h * 2) / 5;
+            const int32_t icon_max = (ICON_VOLUME_UP_W * 3) / 2;
+            if (icon_target > icon_max) icon_target = icon_max;
+            if (icon_target > ICON_VOLUME_UP_W) {
+                lv_image_set_scale(icon, (256 * icon_target) / ICON_VOLUME_UP_W);
+            }
+            lv_obj_center(icon);
         }
-        lv_obj_center(icon);
     }
 }
 
