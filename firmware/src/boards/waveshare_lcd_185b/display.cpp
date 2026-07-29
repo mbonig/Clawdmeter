@@ -22,7 +22,7 @@ static Arduino_ST77916*   gfx = nullptr;
 void display_hal_init(void) {
     bus = new Arduino_ESP32QSPI(
         LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
-    gfx = new Arduino_ST77916(bus, LCD_RESET, 0, true, LCD_WIDTH, LCD_HEIGHT,
+    gfx = new Arduino_ST77916(bus, LCD_RESET, LCD_ROTATION, true, LCD_WIDTH, LCD_HEIGHT,
                               0, 0, 0, 0,
                               st77916_waveshare_185b_init_operations_v2,
                               sizeof(st77916_waveshare_185b_init_operations_v2));

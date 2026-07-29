@@ -19,6 +19,29 @@ static void IRAM_ATTR touch_isr(void) {
     touch_data_ready = true;
 }
 
+// The CST816 always reports in the panel's native orientation, regardless of
+// what MADCTL the display driver is set to — so its coordinates have to be
+// rotated by hand to match LCD_ROTATION or every tap lands somewhere else.
+// Both this and the display constructor read that one constant, so they can't
+// drift apart. Panel is square (360x360), so the axes swap with no dimension
+// change to account for.
+static inline void rotate_touch(uint16_t rx, uint16_t ry,
+                                uint16_t* sx, uint16_t* sy) {
+#if LCD_ROTATION == 1
+    *sx = LCD_HEIGHT - 1 - ry;
+    *sy = rx;
+#elif LCD_ROTATION == 2
+    *sx = LCD_WIDTH  - 1 - rx;
+    *sy = LCD_HEIGHT - 1 - ry;
+#elif LCD_ROTATION == 3
+    *sx = ry;
+    *sy = LCD_WIDTH  - 1 - rx;
+#else
+    *sx = rx;
+    *sy = ry;
+#endif
+}
+
 static void touch_read_into_shared_state(void) {
     Wire.beginTransmission(CST816_ADDR);
     Wire.write(0x02);
@@ -33,8 +56,12 @@ static void touch_read_into_shared_state(void) {
         touch_pressed = false;
         return;
     }
-    touch_x = ((uint16_t)(xH & 0x0F) << 8) | xL;
-    touch_y = ((uint16_t)(yH & 0x0F) << 8) | yL;
+    uint16_t raw_x = ((uint16_t)(xH & 0x0F) << 8) | xL;
+    uint16_t raw_y = ((uint16_t)(yH & 0x0F) << 8) | yL;
+    uint16_t sx, sy;
+    rotate_touch(raw_x, raw_y, &sx, &sy);
+    touch_x = sx;
+    touch_y = sy;
     touch_pressed = true;
 }
 

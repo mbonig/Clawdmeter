@@ -13,6 +13,13 @@
 #define LCD_WIDTH            360
 #define LCD_HEIGHT           360
 
+// Arduino_GFX rotation: 0/1/2/3 = 0°/90°/180°/270° clockwise. 3 puts the USB
+// port at the bottom of the panel (the board's native orientation has it on
+// the right, so the physical board turns 90° CW and the content turns 90° CCW
+// to compensate). display.cpp and touch.cpp both derive from this one value —
+// changing it alone re-rotates the image AND the touch mapping together.
+#define LCD_ROTATION         3
+
 // ---- QSPI display pins (ST77916) ----
 #define LCD_CS               21
 #define LCD_SCLK             40
