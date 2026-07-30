@@ -212,33 +212,38 @@ def test_full_payload_fits_one_ble_write(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Quote of the day (softwarequotes.com scrape)
+# Software quotes (softwarequotes.com scrape + 5-minute rotation)
 # ---------------------------------------------------------------------------
 
-QOD_PAGE = """
-<main><section class="container">
-  <h1 class="main-title">Software Quote of the Day</h1>
+def _quote_block(text, author="Anonymous"):
+    return f"""
   <div class="quote mt60 wow zoomIn mb20">
     <div class="quote__center">
-      <a href="https://softwarequotes.com/quote/x">
-        <p>With enough practice, any interface is intuitive.
-</p>
-      </a>
+      <a href="https://softwarequotes.com/quote/x"><p>{text}
+</p></a>
     </div>
-    <div class="quote__author">
-        <a href="https://softwarequotes.com/author/anonymous">
-          Anonymous
-        </a>
-    </div>
-    <div class="quote__meta"><p class="gray-font">Proverb</p></div>
+    <div class="quote__author"><a href="https://softwarequotes.com/author/a">
+        {author}
+    </a></div>
   </div>
-</section></main>
 """
 
 
-class _FakePageClient:
-    def __init__(self, body="", exc=None):
-        self._body, self._exc = body, exc
+QOD_PAGE = "<main>" + _quote_block("With enough practice, any interface is intuitive.") + "</main>"
+TOPIC_LINKS = "".join(
+    f'<a href="https://softwarequotes.com/topic/{t}">{t}</a>'
+    for t in ("code", "design", "funny", "bug", "obscure1", "obscure2"))
+HOME_PAGE = "<main>" + TOPIC_LINKS[:3 * len('<a href="https://softwarequotes.com/topic/code">code</a>')] + "</main>"
+TOPICS_PAGE = "<main>" + TOPIC_LINKS + "</main>"
+
+
+class _FakeSite:
+    """Serves canned pages per URL, recording what was asked for."""
+
+    def __init__(self, pages=None, exc=None):
+        self.pages = pages or {}
+        self.exc = exc
+        self.requested = []
 
     async def __aenter__(self):
         return self
@@ -247,9 +252,16 @@ class _FakePageClient:
         return False
 
     async def get(self, url, headers=None):
-        if self._exc:
-            raise self._exc
-        return _FakeTextResponse(self._body)
+        self.requested.append(url)
+        if self.exc:
+            raise self.exc
+        for key, body in self.pages.items():
+            if url.endswith(key):
+                return _FakeTextResponse(body)
+        # An unlisted topic page: two quotes named after it.
+        slug = url.rstrip("/").rsplit("/", 1)[-1]
+        return _FakeTextResponse(
+            "<main>" + _quote_block(f"{slug} one") + _quote_block(f"{slug} two") + "</main>")
 
 
 class _FakeTextResponse:
@@ -260,90 +272,128 @@ class _FakeTextResponse:
         pass
 
 
-def _patch_page(monkeypatch, body="", exc=None):
-    monkeypatch.setattr(mod.httpx, "AsyncClient",
-                        lambda *a, **kw: _FakePageClient(body, exc))
+def _patch_site(monkeypatch, pages=None, exc=None):
+    site = _FakeSite(pages, exc)
+    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **kw: site)
+    return site
 
 
-def test_fetch_qod_keeps_a_normal_length_quote_whole(monkeypatch):
+DEFAULT_PAGES = {"quote-of-the-day": QOD_PAGE, "topics": TOPICS_PAGE,
+                 "softwarequotes.com/": HOME_PAGE}
+
+
+def test_parse_quotes_pairs_each_text_with_its_own_author():
+    page = "<main>" + _quote_block("First one.", "Dijkstra") + _quote_block("Second one.", "Knuth") + "</main>"
+    assert mod.parse_quotes(page) == [
+        {"t": "First one.", "a": "Dijkstra"},
+        {"t": "Second one.", "a": "Knuth"},
+    ]
+
+
+def test_parse_quotes_folds_typographic_punctuation_to_ascii():
+    page = "<main>" + _quote_block("Don\u2019t \u201cfix\u201d it \u2014 rewrite it\u2026", "Ada Lovel\u00e1ce") + "</main>"
+    q = mod.parse_quotes(page)[0]
+    # The device's fonts are ASCII-only subsets: a stray glyph renders as a blank.
+    assert q == {"t": 'Don\'t "fix" it - rewrite it...', "a": "Ada Lovelace"}
+    assert all(0x20 <= ord(c) <= 0x7E for c in q["t"] + q["a"])
+
+
+def test_parse_quotes_keeps_a_normal_length_quote_whole():
     body = "Any fool can write code that a computer can understand. " * 2
-    _patch_page(monkeypatch, QOD_PAGE.replace(
-        "With enough practice, any interface is intuitive.", body))
-    assert _run(mod.fetch_quote_of_day())["t"] == body.strip()
+    assert mod.parse_quotes("<main>" + _quote_block(body) + "</main>")[0]["t"] == body.strip()
 
 
-def test_fetch_qod_extracts_text_and_author(monkeypatch):
-    _patch_page(monkeypatch, QOD_PAGE)
-    assert _run(mod.fetch_quote_of_day()) == {
-        "t": "With enough practice, any interface is intuitive.",
-        "a": "Anonymous",
-    }
-
-
-def test_fetch_qod_folds_typographic_punctuation_to_ascii(monkeypatch):
-    page = QOD_PAGE.replace(
-        "With enough practice, any interface is intuitive.",
-        "Don’t “fix” it — rewrite it… said Ada Loveláce")
-    _patch_page(monkeypatch, page)
-    # The device's fonts are ASCII-only subsets, so nothing outside 0x20-0x7E
-    # may survive — a stray glyph renders as a blank.
-    text = _run(mod.fetch_quote_of_day())["t"]
-    assert text == 'Don\'t "fix" it - rewrite it... said Ada Lovelace'
-    assert all(0x20 <= ord(c) <= 0x7E for c in text)
-
-
-def test_fetch_qod_cuts_only_essay_length_text_on_a_word_boundary(monkeypatch):
+def test_parse_quotes_cuts_only_essay_length_text_on_a_word_boundary():
     # QOD_MAX_CHARS is a sanity bound, not a fitting mechanism — the device
     # shrinks its font for long quotes, so only something absurd gets cut.
-    long_text = "word " * 120
-    _patch_page(monkeypatch, QOD_PAGE.replace(
-        "With enough practice, any interface is intuitive.", long_text))
-    text = _run(mod.fetch_quote_of_day())["t"]
+    text = mod.parse_quotes("<main>" + _quote_block("word " * 120) + "</main>")[0]["t"]
     assert len(text) <= mod.QOD_MAX_CHARS
     assert text.endswith("word...")
 
 
-def test_fetch_qod_returns_none_when_markup_changes(monkeypatch):
-    _patch_page(monkeypatch, "<div class='brand-new-markup'>hello</div>")
-    assert _run(mod.fetch_quote_of_day()) is None
+def test_parse_quotes_ignores_unknown_markup():
+    assert mod.parse_quotes("<div class='brand-new-markup'>hello</div>") == []
 
 
-def test_fetch_qod_returns_none_on_transport_error(monkeypatch):
-    _patch_page(monkeypatch, exc=mod.httpx.ConnectError("nope"))
-    assert _run(mod.fetch_quote_of_day()) is None
+def test_pool_leads_with_the_quote_of_the_day_and_adds_topics(monkeypatch):
+    _patch_site(monkeypatch, DEFAULT_PAGES)
+    pool = _run(mod.fetch_quote_pool())
+    assert pool[0] == {"t": "With enough practice, any interface is intuitive.",
+                       "a": "Anonymous"}
+    assert len(pool) > 1
+    assert len({q["t"] for q in pool}) == len(pool)   # deduplicated
+
+
+def test_pool_is_empty_when_the_site_is_unreachable(monkeypatch):
+    _patch_site(monkeypatch, exc=mod.httpx.ConnectError("nope"))
+    assert _run(mod.fetch_quote_pool()) == []
+
+
+def test_pool_prefers_the_featured_topics_then_samples_others(monkeypatch):
+    site = _patch_site(monkeypatch, DEFAULT_PAGES)
+    monkeypatch.setattr(mod, "QOD_FEATURED_TOPICS", 2)
+    monkeypatch.setattr(mod, "QOD_RANDOM_TOPICS", 1)
+    _run(mod.fetch_quote_pool())
+    topic_urls = [u for u in site.requested if "/topic/" in u]
+    assert len(topic_urls) == 3
+    assert topic_urls[0].endswith("/topic/code")      # featured, in page order
+    assert topic_urls[1].endswith("/topic/design")
+
+
+def _enable_quotes(tmp_path, monkeypatch):
+    cfg = tmp_path / "config"
+    cfg.write_text("quote_of_day = on\n")
+    monkeypatch.setattr(mod, "CONFIG_FILE", cfg)
+    monkeypatch.setattr(mod, "_qod_pool", [])
+    monkeypatch.setattr(mod, "_qod_pool_at", 0.0)
+    monkeypatch.setattr(mod, "_qod_index", 0)
+    monkeypatch.setattr(mod, "_qod_shown_at", 0.0)
+
+
+POOL = [{"t": "one", "a": "A"}, {"t": "two", "a": "B"}, {"t": "three", "a": "C"}]
 
 
 def test_add_qod_absent_unless_opted_in(tmp_path, monkeypatch):
     cfg = tmp_path / "config"
     cfg.write_text("clock = auto\n")
     monkeypatch.setattr(mod, "CONFIG_FILE", cfg)
-    monkeypatch.setattr(mod, "_qod_cache", None)
     payload = {}
     _run(mod.add_quote_of_day_field(payload))
     assert "qd" not in payload
 
 
-def test_add_qod_caches_and_survives_a_failed_rescrape(tmp_path, monkeypatch):
-    cfg = tmp_path / "config"
-    cfg.write_text("quote_of_day = on\n")
-    monkeypatch.setattr(mod, "CONFIG_FILE", cfg)
-    monkeypatch.setattr(mod, "_qod_cache", None)
-    good = {"t": "Simplicity is prerequisite for reliability.", "a": "Dijkstra"}
-
-    fetch = AsyncMock(return_value=good)
-    with patch.object(mod, "fetch_quote_of_day", fetch):
-        first = {}
+def test_add_qod_holds_one_quote_until_the_rotation_elapses(tmp_path, monkeypatch):
+    _enable_quotes(tmp_path, monkeypatch)
+    with patch.object(mod, "fetch_quote_pool", AsyncMock(return_value=list(POOL))):
+        first, second = {}, {}
         _run(mod.add_quote_of_day_field(first))
-        second = {}
         _run(mod.add_quote_of_day_field(second))
-    assert fetch.await_count == 1        # within TTL
-    assert second["qd"] == good
+    assert first["qd"] == POOL[0] == second["qd"]   # same quote within QOD_ROTATE
 
-    monkeypatch.setattr(mod, "QOD_TTL", 0)
-    with patch.object(mod, "fetch_quote_of_day", AsyncMock(return_value=None)):
-        third = {}
-        _run(mod.add_quote_of_day_field(third))
-    assert third["qd"] == good           # last good quote still served
+
+def test_add_qod_advances_every_rotation_and_wraps(tmp_path, monkeypatch):
+    _enable_quotes(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "QOD_ROTATE", 0)   # every poll counts as elapsed
+    fetch = AsyncMock(return_value=list(POOL))
+    seen = []
+    with patch.object(mod, "fetch_quote_pool", fetch):
+        for _ in range(4):
+            payload = {}
+            _run(mod.add_quote_of_day_field(payload))
+            seen.append(payload["qd"]["t"])
+    assert seen == ["one", "two", "three", "one"]   # rotates, then wraps
+    assert fetch.await_count == 1                    # pool built once, not per poll
+
+
+def test_add_qod_keeps_rotating_when_a_rebuild_fails(tmp_path, monkeypatch):
+    _enable_quotes(tmp_path, monkeypatch)
+    with patch.object(mod, "fetch_quote_pool", AsyncMock(return_value=list(POOL))):
+        _run(mod.add_quote_of_day_field({}))
+    monkeypatch.setattr(mod, "QOD_POOL_TTL", 0)     # force a rebuild attempt
+    with patch.object(mod, "fetch_quote_pool", AsyncMock(return_value=[])):
+        payload = {}
+        _run(mod.add_quote_of_day_field(payload))
+    assert payload["qd"] == POOL[0]                 # old pool still serving
 
 
 # ---------------------------------------------------------------------------
@@ -436,12 +486,11 @@ def test_write_drops_the_quote_only_when_it_cannot_fit_alone():
 
 
 def test_write_leaves_the_cached_quote_untouched(tmp_path, monkeypatch):
-    """The writer may rewrite payload["qd"] to a sentinel; the cache it came from
-    must survive intact, or the next poll would send a mutilated quote."""
-    cfg = tmp_path / "config"
-    cfg.write_text("quote_of_day = on\n")
-    monkeypatch.setattr(mod, "CONFIG_FILE", cfg)
-    monkeypatch.setattr(mod, "_qod_cache", (time.time(), dict(LONG_QUOTE)))
+    """The writer may rewrite payload["qd"] to a sentinel; the pool entry it came
+    from must survive intact, or the next poll would send a mutilated quote."""
+    _enable_quotes(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_qod_pool", [dict(LONG_QUOTE)])
+    monkeypatch.setattr(mod, "_qod_pool_at", time.time())
     s = _session(256)
     for _ in range(2):
         payload = _usage_payload()

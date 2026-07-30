@@ -13,6 +13,7 @@ import getpass
 import html
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -75,23 +76,38 @@ TICKER_ALIASES = {"spacex": "SPCX"}
 # sym -> (fetched_at, payload dict)
 _quote_cache: dict[str, tuple[float, dict]] = {}
 
-# Software quote of the day, scraped from softwarequotes.com — it publishes no
-# RSS feed, JSON API or embed, so the page markup is the only interface. Both
-# patterns below are anchored on the class names wrapping the quote; if the site
-# restyles, fetch_quote_of_day() logs and returns None rather than sending junk.
+# Software quotes scraped from softwarequotes.com — it publishes no RSS feed,
+# JSON API or embed, so the page markup is the only interface. The patterns below
+# are anchored on the class names wrapping each quote; if the site restyles,
+# fetch_quote_pool() logs and returns nothing rather than sending junk.
 QOD_URL = "https://softwarequotes.com/quote-of-the-day"
+QOD_HOME_URL = "https://softwarequotes.com/"
+QOD_TOPICS_URL = "https://softwarequotes.com/topics"
+QOD_BLOCK_SPLIT_RE = re.compile(r'<div class="quote[ "]')
 QOD_TEXT_RE = re.compile(r'quote__center.*?<p>(.*?)</p>', re.S)
 QOD_AUTHOR_RE = re.compile(r'quote__author.*?<a[^>]*>(.*?)</a>', re.S)
-# It changes once a day, so re-scraping on the usage-poll cadence would be 1440
-# requests/day for one string. Six hours still catches the rollover promptly.
-QOD_TTL = 6 * 3600
+QOD_TOPIC_RE = re.compile(r'href="https://softwarequotes\.com/(topic/[^"?#]+)"')
+# The device shows a different quote every QOD_ROTATE seconds, which needs a pool
+# of them: /quote-of-the-day serves one quote for the whole day, so rotating on
+# that page alone would just re-send the same string. The site has no listing or
+# random endpoint either, so the pool is assembled from topic pages. Those are a
+# long tail — the ~265 topics in /topics mostly hold 1-6 quotes each, while the
+# handful the site features on its home page hold 20+ — so the sample is seeded
+# with the featured ones and topped up at random for variety. The actual quote of
+# the day always leads the pool.
+QOD_ROTATE = 300
+QOD_POOL_TTL = 6 * 3600
+QOD_FEATURED_TOPICS = 10   # from the home page — the densest topic pages
+QOD_RANDOM_TOPICS = 6      # from /topics — rotates the mix between rebuilds
 # A sanity bound, not a fitting mechanism: the device drops to a smaller font as
 # the text grows, so anything up to ~300 characters wraps into its panel intact.
 # Quotes are never shortened to fit a BLE write (see Session.write_payload) —
 # only a genuinely essay-length one gets cut here, at a word boundary.
 QOD_MAX_CHARS = 300
-# (fetched_at, {"t": text, "a": author}) — a single entry, unlike _quote_cache.
-_qod_cache: tuple[float, dict] | None = None
+_qod_pool: list[dict] = []   # [{"t": text, "a": author}, ...], quote of the day first
+_qod_pool_at = 0.0           # when the pool was built
+_qod_index = 0               # which one is currently on the device
+_qod_shown_at = 0.0          # when it went out, for the QOD_ROTATE timer
 
 
 def log(msg: str) -> None:
@@ -570,51 +586,111 @@ def _shorten(text: str, limit: int) -> str:
     return cut.rstrip(",;:.") + "..."
 
 
-async def fetch_quote_of_day() -> dict | None:
-    """Scrape today's software quote of the day, or None if it can't be read."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
-            resp = await http.get(QOD_URL, headers=QUOTE_HEADERS)
-            resp.raise_for_status()
-            page = resp.text
-    except httpx.HTTPError as e:
-        log(f"Quote-of-the-day fetch failed: {e}")
-        return None
+def parse_quotes(page: str) -> list[dict]:
+    """Every quote on a softwarequotes.com page, as device payload dicts.
 
-    text_m = QOD_TEXT_RE.search(page)
-    if not text_m:
-        log("Quote-of-the-day page markup changed; no quote found")
-        return None
-    text = _strip_markup(text_m.group(1))
-    if not text:
-        log("Quote-of-the-day text was empty")
-        return None
-    quote = {"t": _shorten(text, QOD_MAX_CHARS)}
-    author_m = QOD_AUTHOR_RE.search(page)
-    if author_m:
-        author = _shorten(_strip_markup(author_m.group(1)), 30)
-        if author:
-            quote["a"] = author
-    return quote
+    Pages are split into per-quote blocks first, so a text can't be paired with
+    the next quote's author when one of them is missing.
+    """
+    quotes = []
+    for block in QOD_BLOCK_SPLIT_RE.split(page)[1:]:
+        text_m = QOD_TEXT_RE.search(block)
+        if not text_m:
+            continue
+        text = _strip_markup(text_m.group(1))
+        if not text:
+            continue
+        quote = {"t": _shorten(text, QOD_MAX_CHARS)}
+        author_m = QOD_AUTHOR_RE.search(block)
+        if author_m:
+            author = _shorten(_strip_markup(author_m.group(1)), 30)
+            if author:
+                quote["a"] = author
+        quotes.append(quote)
+    return quotes
+
+
+async def _get_page(http: httpx.AsyncClient, url: str) -> str:
+    """GET a page, returning "" on any transport or HTTP failure."""
+    try:
+        resp = await http.get(url, headers=QUOTE_HEADERS)
+        resp.raise_for_status()
+        return resp.text
+    except httpx.HTTPError as e:
+        log(f"Quote page fetch failed ({url}): {e}")
+        return ""
+
+
+def _pick_topics(home_page: str, topics_page: str) -> list[str]:
+    """Topic paths to scrape: the home page's featured ones plus random others."""
+    featured = list(dict.fromkeys(QOD_TOPIC_RE.findall(home_page)))[:QOD_FEATURED_TOPICS]
+    others = [t for t in dict.fromkeys(QOD_TOPIC_RE.findall(topics_page))
+              if t not in featured]
+    extra = random.sample(others, min(QOD_RANDOM_TOPICS, len(others))) if others else []
+    return featured + extra
+
+
+async def fetch_quote_pool() -> list[dict]:
+    """Build the rotation pool: the quote of the day, then a sample of topics.
+
+    Deduplicated by text, and shuffled below the first entry so consecutive
+    quotes don't all come from the same topic page. Empty if the site is
+    unreachable or its markup moved — callers keep their previous pool.
+    """
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+        qod_page, home_page, topics_page = await asyncio.gather(
+            _get_page(http, QOD_URL),
+            _get_page(http, QOD_HOME_URL),
+            _get_page(http, QOD_TOPICS_URL),
+        )
+        pool = parse_quotes(qod_page)
+        topics = _pick_topics(home_page, topics_page)
+        if topics:
+            pages = await asyncio.gather(
+                *(_get_page(http, f"https://softwarequotes.com/{t}") for t in topics))
+            rest = [q for page in pages for q in parse_quotes(page)]
+            random.shuffle(rest)
+            pool += rest
+
+    seen, unique = set(), []
+    for quote in pool:
+        if quote["t"] not in seen:
+            seen.add(quote["t"])
+            unique.append(quote)
+    if not unique:
+        log("Quote pool came back empty; site unreachable or markup changed")
+    return unique
 
 
 async def add_quote_of_day_field(payload: dict) -> None:
     """Add "qd":{"t","a"} to the payload when the config opts in.
 
-    Cached for QOD_TTL; a failed scrape keeps serving the last good quote, since
-    a day-old software aphorism is no less true than today's.
+    Advances through the pool every QOD_ROTATE seconds — in practice on the next
+    poll after that elapses, since the device only hears from us once a minute.
+    A failed rebuild keeps the existing pool rotating rather than going blank.
     """
-    global _qod_cache
+    global _qod_pool, _qod_pool_at, _qod_index, _qod_shown_at
     if read_config_flag("quote_of_day") != "on":
         return
-    if _qod_cache is None or time.time() - _qod_cache[0] >= QOD_TTL:
-        quote = await fetch_quote_of_day()
-        if quote is not None:
-            _qod_cache = (time.time(), quote)
-    if _qod_cache is not None:
-        # A copy: the payload is handed to the writer, which may rewrite the
-        # field, and the cache must stay pristine for the next poll.
-        payload["qd"] = dict(_qod_cache[1])
+    now = time.time()
+    rebuilt = False
+    if not _qod_pool or now - _qod_pool_at >= QOD_POOL_TTL:
+        pool = await fetch_quote_pool()
+        if pool:
+            _qod_pool, _qod_pool_at = pool, now
+            _qod_index, _qod_shown_at = 0, now
+            rebuilt = True
+            log(f"Quote pool rebuilt: {len(pool)} quotes")
+    if not _qod_pool:
+        return
+    # A fresh pool starts on its first entry — the actual quote of the day —
+    # rather than immediately stepping off it.
+    if not rebuilt and now - _qod_shown_at >= QOD_ROTATE:
+        _qod_index = (_qod_index + 1) % len(_qod_pool)
+        _qod_shown_at = now
+    # A copy: the payload is handed to the writer, which may rewrite the field,
+    # and the pool must stay pristine for the next poll.
+    payload["qd"] = dict(_qod_pool[_qod_index])
 
 
 async def poll_api(token: str) -> dict | None:
