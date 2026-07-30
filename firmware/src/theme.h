@@ -10,7 +10,7 @@
 // Terra-cotta, brightened one step from Anthropic's brand #d97757 (same ~15° hue,
 // saturation 60%->68%, value 85%->91%) because the brand value reads as drab against
 // the true-black background. KEEP IN SYNC with two other places that must use the
-// identical value: the splash palette remap in tools/convert_to_c.js (the pixel-art
+// identical value: the creature palette remap in tools/convert_to_c.js (the pixel-art
 // creature is recoloured to this so it matches the UI), and the `pace_hex` recolor
 // string in ui.cpp (LVGL label recoloring needs a literal hex, not a token).
 #define THEME_ACCENT   lv_color_hex(0xe8734a)   // brand terra-cotta, brightened

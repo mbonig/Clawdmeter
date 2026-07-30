@@ -1,5 +1,5 @@
 #include "ui.h"
-#include "splash.h"
+#include "creature.h"
 #include <lvgl.h>
 #include <time.h>
 #include "logo.h"
@@ -176,7 +176,7 @@ static void compute_layout(const BoardCaps& c) {
         L.pct_font   = &font_styrene_48;
         L.reset_font = &font_styrene_20;
         // Same class of bug as the null pct_font/reset_font above: idle_px was
-        // never set on this breakpoint (or "compact" below), so splash_mini_create()
+        // never set on this breakpoint (or "compact" below), so creature_create()
         // received px=0, floored its cell size to the 1px minimum, and rendered
         // the sleeping-creature idle screen as a 20x20px dot instead of a real
         // creature. Harmless-looking on every board that's shipped so far only
@@ -312,7 +312,7 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_RED       THEME_RED
 #define COL_BAR_BG    THEME_BAR_BG
 
-// ---- Usage screen widgets (single non-splash view) ----
+// ---- Usage screen widgets (the only view) ----
 static lv_obj_t* usage_container;
 static lv_obj_t* lbl_title;
 // Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
@@ -383,7 +383,6 @@ static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within t
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
-static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
@@ -475,9 +474,6 @@ static void format_reset_time(int mins, char* buf, size_t len) {
     }
 }
 
-// Forward decls — callbacks defined near ui_show_screen below
-static void global_click_cb(lv_event_t* e);
-
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
     lv_obj_set_pos(panel, x, y);
@@ -516,8 +512,8 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
 // onto [start_angle, end_angle]) instead of a rectangular bar. Two of these,
 // covering the top and bottom halves respectively, form one ring split into
 // independent current/weekly fills. Non-interactive — knob removed, not
-// clickable — so it behaves like the bar it replaces (tap passes through to
-// usage_container's splash-toggle handler).
+// clickable — so it behaves like the bar it replaces: taps on the numbers do
+// nothing at all.
 static lv_obj_t* make_gauge_arc(lv_obj_t* parent, int32_t start_angle, int32_t end_angle) {
     lv_obj_t* arc = lv_arc_create(parent);
     lv_obj_set_size(arc, 2 * L.round_r_out, 2 * L.round_r_out);
@@ -623,8 +619,7 @@ static void init_control_bar_icons(void) {
 }
 
 // Buttons are plain lv_obj_t (not lv_btn_create()), matching this file's existing
-// hand-styled-panel convention. Deliberately NOT given LV_OBJ_FLAG_EVENT_BUBBLE, so a
-// tap here never reaches usage_container's global_click_cb (splash/idle toggle).
+// hand-styled-panel convention.
 static void control_btn_event_cb(lv_event_t* e) {
     lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
     ble_consumer_key_t key = (ble_consumer_key_t)(intptr_t)lv_obj_get_user_data(btn);
@@ -734,11 +729,21 @@ static ticker_kind_t ticker_card_kind(int i, int* quote_idx) {
     return TICKER_QUOTE;
 }
 
+// Tapping the rotator advances to the next card — defined below, once the
+// render/dot helpers it calls exist.
+static void ticker_click_cb(lv_event_t* e);
+
 // One panel cycling the clock and each quote the daemon sent: caption, big
 // value, sub-line, plus page dots. The text stack lives in its own transparent
 // box so a card change can fade the text in without pulsing the panel itself.
 static void build_ticker_panel(lv_obj_t* parent) {
     ticker_panel = make_panel(parent, L.margin, L.ticker_y, L.content_w, L.ticker_h);
+    // The panel is the one interactive thing on this screen: tap it to skip
+    // ahead instead of waiting out the dwell. Its children all bubble their
+    // events up here (make_panel/build below set LV_OBJ_FLAG_EVENT_BUBBLE), so
+    // a tap anywhere inside the panel counts.
+    lv_obj_add_flag(ticker_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ticker_panel, ticker_click_cb, LV_EVENT_CLICKED, NULL);
 
     ticker_card_box = lv_obj_create(ticker_panel);
     lv_obj_set_size(ticker_card_box, LV_PCT(100), LV_PCT(100));
@@ -906,6 +911,25 @@ static void render_ticker_card(void) {
     }
 }
 
+// Advance to the next card. Shared by the tap gesture and — implicitly, via the
+// dwell timer — by ticker_tick(). Restarts the dwell so a tapped card gets its
+// full time on screen rather than however much was left of the previous one.
+static void ticker_advance(void) {
+    const int n = ticker_card_count();
+    if (n <= 1) return;
+    ticker_card = (ticker_card + 1) % n;
+    ticker_card_ms = lv_tick_get();
+    ticker_dirty = false;
+    render_ticker_card();
+    layout_ticker_dots(n, ticker_card);
+    lv_obj_fade_in(ticker_card_box, TICKER_FADE_MS, 0);
+}
+
+static void ticker_click_cb(lv_event_t* e) {
+    (void)e;
+    ticker_advance();
+}
+
 // Called every loop from ui_tick_anim(). Advances the card on its own dwell,
 // keeps the clock card's seconds moving, and hides the panel outright when the
 // daemon sent no clock, no quote of the day and no market quotes — i.e. every
@@ -922,7 +946,6 @@ static void ticker_tick(uint32_t now) {
     }
     lv_obj_clear_flag(ticker_panel, LV_OBJ_FLAG_HIDDEN);
 
-    bool fade = false;
     if (n != shown_count) {
         shown_count = n;
         if (ticker_card >= n) ticker_card = 0;
@@ -932,16 +955,15 @@ static void ticker_tick(uint32_t now) {
     const ticker_kind_t cur_kind = ticker_card_kind(ticker_card, &cur_quote_idx);
     const uint32_t dwell = (cur_kind == TICKER_QOD) ? TICKER_QOD_MS : TICKER_CARD_MS;
     if (n > 1 && now - ticker_card_ms >= dwell) {
-        ticker_card = (ticker_card + 1) % n;
-        ticker_card_ms = now;
-        ticker_dirty = fade = true;
+        ticker_advance();
+        return;
     }
 
+    // New data for the card already on screen — repaint in place, no fade.
     if (ticker_dirty) {
         ticker_dirty = false;
         render_ticker_card();
         layout_ticker_dots(n, ticker_card);
-        if (fade) lv_obj_fade_in(ticker_card_box, TICKER_FADE_MS, 0);
         return;
     }
     // Between switches only the clock card needs repainting, once per second.
@@ -1035,7 +1057,7 @@ static void build_idle_group(lv_obj_t* parent) {
     // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
+    lv_obj_t* creature = creature_create(idle_group, "expression sleep", L.idle_px);
     if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
@@ -1049,7 +1071,8 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_border_width(usage_container, 0, 0);
     lv_obj_set_style_pad_all(usage_container, 0, 0);
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    // No handler here: taps on the usage numbers are deliberately inert. Only the
+    // media buttons and the center rotator react to touch.
 
     lbl_title = lv_label_create(usage_container);
     lv_label_set_text(lbl_title, "Usage");
@@ -1178,10 +1201,8 @@ static void init_usage_screen(lv_obj_t* scr) {
 
     // pair_group/idle_group are created after the control bar and are both full-width
     // panels covering everything below the header, so in LVGL's create-order z-stacking
-    // they sit ON TOP of the bar and silently swallow every tap aimed at it (the press
-    // hit idle_group, bubbled to usage_container, and global_click_cb's dead zone then
-    // dropped it — so nothing happened at all). Lift the bar back to the front so its
-    // buttons are actually hittable on the idle screen.
+    // they sit ON TOP of the bar and silently swallow every tap aimed at it. Lift the
+    // bar back to the front so its buttons are actually hittable on the idle screen.
     if (control_bar) lv_obj_move_foreground(control_bar);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
@@ -1216,11 +1237,6 @@ void ui_init(void) {
     if (board_caps().has_media_controls) init_control_bar_icons();
 
     init_usage_screen(scr);
-    splash_init(scr);
-
-    if (splash_get_root()) {
-        lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
-    }
 
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
@@ -1367,9 +1383,8 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
     update_view_state();
-    if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
+    if (view_state == 1) creature_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
 
@@ -1426,71 +1441,6 @@ void ui_tick_anim(void) {
     lv_label_set_text(lbl_anim, buf);
 }
 
-static screen_t prev_non_splash_screen = SCREEN_USAGE;
-static void apply_battery_visibility(void) {
-    if (!battery_img) return;
-    // Round boards keep it hidden regardless of screen — see ui_init().
-    if (L.is_round) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void global_click_cb(lv_event_t* e) {
-    (void)e;
-    // Ignore taps inside the media/volume control-bar band, so a near-miss on one of
-    // its buttons doesn't fall through to the "tap anywhere toggles splash" gesture
-    // and yank the screen away. Checked by raw coordinate rather than by which widget
-    // received the click, so it holds regardless of the hit-test path a near-miss
-    // takes through the widget tree.
-    //
-    // The band is the bar's own bounds plus a small margin. It used to be 300px,
-    // compensating for taps that appeared to land 150-300px short — but that was the
-    // GT911 field-misread bug (see boards/waveshare_p4_touch_lcd_5/touch.cpp), not
-    // real aiming error. Coordinates are accurate now, so the huge dead zone is
-    // unnecessary and only made a large part of the screen mysteriously inert.
-    if (board_caps().has_media_controls && L.control_bar_h > 0) {
-        lv_indev_t* indev = lv_indev_active();
-        if (indev) {
-            lv_point_t p;
-            lv_indev_get_point(indev, &p);
-            if (p.y >= L.control_bar_y - 20) return;
-        }
-    }
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
-}
-
-void ui_show_screen(screen_t screen) {
-    lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    splash_hide();
-
-    switch (screen) {
-    case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    default: break;
-    }
-
-    // Round boards never show the logo (no room for it in the header) —
-    // ui_init() hides it permanently, so leave it alone here.
-    if (logo_img && !L.is_round) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
-    current_screen = screen;
-    apply_battery_visibility();
-}
-
-void ui_toggle_splash(void) {
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
-}
-
-screen_t ui_get_current_screen(void) {
-    return current_screen;
-}
-
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
     (void)name; (void)mac;
     bool was_connected = s_ble_connected;
@@ -1518,5 +1468,4 @@ void ui_update_battery(int percent, bool charging) {
         idx = 3;
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
-    apply_battery_visibility();
 }
