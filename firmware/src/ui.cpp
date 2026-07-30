@@ -59,6 +59,14 @@ struct Layout {
     int16_t control_bar_h;           // band height (both rows)
     int16_t control_btn_h;           // per-button height, shared by both rows
     int16_t control_btn_gap;         // gutter between neighbouring buttons
+    // Center rotator — a panel between the usage panels and whatever is
+    // anchored to the bottom, cycling through the clock and any market quotes
+    // the daemon sends. Zero height = this board has no room for one.
+    int16_t ticker_y, ticker_h;
+    const lv_font_t* ticker_value_font;   // the big line (time / price)
+    const lv_font_t* ticker_label_font;   // caption above it (weekday / symbol)
+    const lv_font_t* ticker_sub_font;     // line below it (date / percent change)
+
     int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
     int16_t batt_y;                  // battery icon top edge
@@ -254,6 +262,28 @@ static void compute_layout(const BoardCaps& c) {
     }
 
     L.content_w = L.scr_w - 2 * L.margin;
+
+    // Center rotator, sized into whatever vertical slack is left between the
+    // bottom of the weekly panel and the next thing anchored to the bottom edge
+    // (the media bar if the board has one, otherwise the status line). Enabled
+    // geometrically rather than by a BoardCaps flag: unlike the media bar this
+    // is purely decorative, and "is there a big empty band here" is exactly the
+    // question being asked. Today only the 1280-tall P4 clears the bar — every
+    // other board's gap is a few dozen pixels, so they're untouched.
+    const int16_t panels_end = L.content_y + 2 * L.usage_panel_h + L.usage_panel_gap;
+    const int16_t bottom_limit = (L.control_bar_h > 0) ? L.control_bar_y
+                                                       : (int16_t)(L.scr_h - 70);
+    const int16_t avail = bottom_limit - panels_end;
+    if (avail >= 240) {
+        // Capped rather than stretched to fill: three lines of text in a
+        // 400px-tall box reads as floating in a void, not as a filled panel.
+        L.ticker_h = (avail - 60 > 260) ? 260 : (int16_t)(avail - 60);
+        L.ticker_y = panels_end + (avail - L.ticker_h) / 2;
+        const bool big = (L.scr_h >= 460);
+        L.ticker_value_font = big ? &font_tiempos_56 : &font_tiempos_34;
+        L.ticker_label_font = big ? &font_styrene_28 : &font_styrene_20;
+        L.ticker_sub_font   = big ? &font_styrene_28 : &font_styrene_20;
+    }
 }
 
 // Anthropic brand palette — design tokens live in theme.h
@@ -295,6 +325,22 @@ static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
+
+// ---- Center rotator (clock + market quotes), boards with vertical slack ----
+static lv_obj_t* ticker_panel = nullptr;   // 0 height in Layout ⇒ never built
+static lv_obj_t* ticker_card_box = nullptr; // the faded-in text stack
+static lv_obj_t* lbl_ticker_label = nullptr;
+static lv_obj_t* lbl_ticker_value = nullptr;
+static lv_obj_t* lbl_ticker_sub = nullptr;
+static lv_obj_t* ticker_dots[1 + MAX_QUOTES] = {};  // clock card + one per quote
+static QuoteData ticker_quotes[MAX_QUOTES] = {};
+static int       ticker_quote_count = 0;
+static int       ticker_card = 0;        // index into the live card list
+static uint32_t  ticker_card_ms = 0;     // when the current card came up
+static int       ticker_clock_sec = -1;  // last second rendered on the clock card
+static bool      ticker_dirty = true;    // re-render pending (new card or new data)
+#define TICKER_CARD_MS 6000              // dwell per card
+#define TICKER_FADE_MS 300
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -632,6 +678,178 @@ static void build_control_bar(lv_obj_t* parent) {
     }
 }
 
+// ======== Center rotator ========
+
+// Local wall-clock time, from the daemon's last epoch advanced by lv_tick. The
+// epoch is already tz-shifted host-side, so gmtime_r keeps it as-is.
+static bool clock_now(struct tm* out) {
+    if (clock_base_epoch <= 0) return false;
+    time_t cur = (time_t)(clock_base_epoch + (lv_tick_get() - clock_base_ms) / 1000);
+    gmtime_r(&cur, out);
+    return true;
+}
+
+static int ticker_card_count(void) {
+    return (clock_base_epoch > 0 ? 1 : 0) + ticker_quote_count;
+}
+
+// One panel cycling the clock and each quote the daemon sent: caption, big
+// value, sub-line, plus page dots. The text stack lives in its own transparent
+// box so a card change can fade the text in without pulsing the panel itself.
+static void build_ticker_panel(lv_obj_t* parent) {
+    ticker_panel = make_panel(parent, L.margin, L.ticker_y, L.content_w, L.ticker_h);
+
+    ticker_card_box = lv_obj_create(ticker_panel);
+    lv_obj_set_size(ticker_card_box, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(ticker_card_box);
+    lv_obj_set_style_bg_opa(ticker_card_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ticker_card_box, 0, 0);
+    lv_obj_set_style_pad_all(ticker_card_box, 0, 0);
+    lv_obj_clear_flag(ticker_card_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ticker_card_box, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    // Thirds of the panel height: caption above center, value on it, sub below.
+    const int16_t off = L.ticker_h / 4;
+
+    lbl_ticker_label = lv_label_create(ticker_card_box);
+    lv_label_set_text(lbl_ticker_label, "");
+    lv_obj_set_style_text_font(lbl_ticker_label, L.ticker_label_font, 0);
+    lv_obj_set_style_text_color(lbl_ticker_label, COL_DIM, 0);
+    lv_obj_align(lbl_ticker_label, LV_ALIGN_CENTER, 0, -off);
+
+    lbl_ticker_value = lv_label_create(ticker_card_box);
+    lv_label_set_text(lbl_ticker_value, "");
+    lv_obj_set_style_text_font(lbl_ticker_value, L.ticker_value_font, 0);
+    lv_obj_set_style_text_color(lbl_ticker_value, COL_TEXT, 0);
+    lv_obj_align(lbl_ticker_value, LV_ALIGN_CENTER, 0, 0);
+
+    lbl_ticker_sub = lv_label_create(ticker_card_box);
+    lv_label_set_text(lbl_ticker_sub, "");
+    lv_obj_set_style_text_font(lbl_ticker_sub, L.ticker_sub_font, 0);
+    lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
+    lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, off);
+
+    // Page dots — parented to the panel, not the fading box, so they stay put
+    // while the card behind them crossfades. Positioned in layout_ticker_dots()
+    // once the live card count is known.
+    for (int i = 0; i < 1 + MAX_QUOTES; i++) {
+        lv_obj_t* dot = lv_obj_create(ticker_panel);
+        lv_obj_set_size(dot, 10, 10);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, COL_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_EVENT_BUBBLE);
+        ticker_dots[i] = dot;
+    }
+}
+
+// Show `count` dots, centered as a row, and highlight the active one. A single
+// card means no dots at all — one dot conveys nothing.
+static void layout_ticker_dots(int count, int active) {
+    const int16_t d = 10, gap = 10;
+    const int16_t total = count * d + (count - 1) * gap;
+    for (int i = 0; i < 1 + MAX_QUOTES; i++) {
+        if (!ticker_dots[i]) continue;
+        if (i >= count || count < 2) {
+            lv_obj_add_flag(ticker_dots[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(ticker_dots[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(ticker_dots[i], LV_ALIGN_BOTTOM_MID,
+                     -total / 2 + i * (d + gap) + d / 2, -12);
+        lv_obj_set_style_bg_color(ticker_dots[i],
+                                  i == active ? COL_ACCENT : COL_BAR_BG, 0);
+    }
+}
+
+static void render_ticker_card(void) {
+    const int n = ticker_card_count();
+    if (n <= 0) return;
+    if (ticker_card >= n) ticker_card = 0;
+
+    const bool has_clock = (clock_base_epoch > 0);
+    char buf[32];
+
+    if (has_clock && ticker_card == 0) {
+        struct tm tmv;
+        if (!clock_now(&tmv)) return;
+        ticker_clock_sec = tmv.tm_sec;
+        strftime(buf, sizeof(buf), "%A", &tmv);
+        lv_label_set_text(lbl_ticker_label, buf);
+        // Seconds included deliberately: this is the one element on screen that
+        // can prove at a glance the device is alive between 60s payloads.
+        if (clock_fmt == 12) {
+            int h12 = tmv.tm_hour % 12;
+            if (h12 == 0) h12 = 12;
+            snprintf(buf, sizeof(buf), "%d:%02d:%02d %s", h12, tmv.tm_min, tmv.tm_sec,
+                     tmv.tm_hour < 12 ? "AM" : "PM");
+        } else {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        }
+        lv_label_set_text(lbl_ticker_value, buf);
+        strftime(buf, sizeof(buf), "%b %d", &tmv);
+        lv_label_set_text(lbl_ticker_sub, buf);
+        lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
+        return;
+    }
+
+    const QuoteData* q = &ticker_quotes[ticker_card - (has_clock ? 1 : 0)];
+    lv_label_set_text(lbl_ticker_label, q->sym);
+    lv_label_set_text(lbl_ticker_value, q->price);
+    if (q->has_chg) {
+        snprintf(buf, sizeof(buf), "%+.2f%%", q->chg_pct);
+        lv_label_set_text(lbl_ticker_sub, buf);
+        lv_obj_set_style_text_color(lbl_ticker_sub,
+                                    q->chg_pct < 0 ? COL_RED : COL_GREEN, 0);
+    } else {
+        lv_label_set_text(lbl_ticker_sub, "");
+    }
+}
+
+// Called every loop from ui_tick_anim(). Advances the card on a timer, keeps the
+// clock card's seconds moving, and hides the panel outright when the daemon has
+// sent neither a clock nor any quotes (an opt-in feature that's simply off).
+static void ticker_tick(uint32_t now) {
+    if (!ticker_panel) return;
+    static int shown_count = -1;
+
+    const int n = ticker_card_count();
+    if (n <= 0) {
+        lv_obj_add_flag(ticker_panel, LV_OBJ_FLAG_HIDDEN);
+        shown_count = 0;
+        return;
+    }
+    lv_obj_clear_flag(ticker_panel, LV_OBJ_FLAG_HIDDEN);
+
+    bool fade = false;
+    if (n != shown_count) {
+        shown_count = n;
+        if (ticker_card >= n) ticker_card = 0;
+        ticker_dirty = true;
+    }
+    if (n > 1 && now - ticker_card_ms >= TICKER_CARD_MS) {
+        ticker_card = (ticker_card + 1) % n;
+        ticker_card_ms = now;
+        ticker_dirty = fade = true;
+    }
+
+    if (ticker_dirty) {
+        ticker_dirty = false;
+        render_ticker_card();
+        layout_ticker_dots(n, ticker_card);
+        if (fade) lv_obj_fade_in(ticker_card_box, TICKER_FADE_MS, 0);
+        return;
+    }
+    // Between switches only the clock card needs repainting, once per second.
+    if (clock_base_epoch > 0 && ticker_card == 0) {
+        struct tm tmv;
+        if (clock_now(&tmv) && tmv.tm_sec != ticker_clock_sec) render_ticker_card();
+    }
+}
+
 // ======== Usage Screen ========
 
 static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
@@ -839,6 +1057,11 @@ static void init_usage_screen(lv_obj_t* scr) {
                          &lbl_weekly_pct, &lbl_weekly_label,
                          &bar_weekly, &lbl_weekly_reset);
 
+        // Center rotator, in usage_group (unlike the media bar below): its quotes
+        // are only as fresh as the payload that carried them, so it belongs with
+        // the numbers that go away when data goes stale.
+        if (L.ticker_h > 0) build_ticker_panel(usage_group);
+
         // Parented to usage_container, NOT usage_group: the media/volume controls have
         // nothing to do with usage data, but usage_group is hidden whenever data goes
         // stale — which made the buttons disappear behind the idle "Listening…" screen
@@ -929,7 +1152,7 @@ void ui_update(const UsageData* data) {
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
 
-    if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
+    if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the clock
         clock_base_epoch = data->clock_epoch;
         clock_base_ms = last_data_ms;
         clock_fmt = data->clock_fmt;
@@ -938,6 +1161,13 @@ void ui_update(const UsageData* data) {
         clock_last_min = -1;
         lv_label_set_text(lbl_title, "Usage");
     }
+
+    // Market quotes for the center rotator. Copied wholesale (including a drop to
+    // zero when the host stops sending them) so the card list always matches the
+    // latest payload rather than accumulating stale symbols.
+    ticker_quote_count = (data->quote_count < MAX_QUOTES) ? data->quote_count : MAX_QUOTES;
+    for (int i = 0; i < ticker_quote_count; i++) ticker_quotes[i] = data->quotes[i];
+    ticker_dirty = true;   // refresh the visible card in place if it's a quote
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -1040,12 +1270,14 @@ void ui_tick_anim(void) {
 
     uint32_t now = lv_tick_get();
 
+    ticker_tick(now);
+
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
-    if (clock_base_epoch > 0) {
-        time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
-        struct tm tmv;
-        gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
+    // Skipped on boards with a center rotator — that panel already shows the time,
+    // in a much bigger font, and the same clock twice on one screen reads as a bug.
+    struct tm tmv;
+    if (clock_base_epoch > 0 && !ticker_panel && clock_now(&tmv)) {
         if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
             clock_last_min = tmv.tm_min;
             char tbuf[12];

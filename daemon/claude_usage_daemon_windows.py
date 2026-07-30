@@ -59,6 +59,20 @@ API_BODY = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 
+# Market quotes for the device's center rotator (opt-in via `tickers` in the
+# config) — mirrors the macOS/Linux daemon; see its comments for why Yahoo's
+# chart endpoint is used and why prices are formatted host-side.
+QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+QUOTE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+QUOTE_TTL = 300
+MAX_TICKERS = 3
+# Convenience aliases for company names that aren't their ticker (SpaceX listed
+# on NasdaqGS as SPCX in June 2026). The device always shows the real symbol
+# that was priced, never the alias it was typed as.
+TICKER_ALIASES = {"spacex": "SPCX"}
+# sym -> (fetched_at, payload dict)
+_quote_cache: dict[str, tuple[float, dict]] = {}
+
 
 def _build_file_logger() -> logging.Logger | None:
     """Create a rotating file logger for field diagnostics, or None.
@@ -154,6 +168,79 @@ def read_clock_setting() -> str:
     return "off"
 
 
+def read_tickers_setting() -> list[str]:
+    """Read the `tickers` option: market symbols for the device's center rotator.
+
+    Comma-separated, aliases resolved, capped at MAX_TICKERS. Empty (default)
+    means no quotes are sent.
+    """
+    raw = ""
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "tickers":
+                    raw = val.strip()
+    except OSError:
+        return []
+    syms: list[str] = []
+    for part in raw.split(","):
+        sym = part.strip()
+        if not sym:
+            continue
+        sym = TICKER_ALIASES.get(sym.lower(), sym).upper()
+        if sym not in syms:
+            syms.append(sym)
+    return syms[:MAX_TICKERS]
+
+
+async def fetch_quote(http: httpx.AsyncClient, sym: str) -> dict | None:
+    """Fetch one symbol as the device's wire form, or None if it can't be priced."""
+    try:
+        resp = await http.get(QUOTE_URL.format(sym=sym), headers=QUOTE_HEADERS)
+        resp.raise_for_status()
+        meta = resp.json()["chart"]["result"][0]["meta"]
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
+        log(f"Quote fetch failed for {sym}: {e}")
+        return None
+
+    price = meta.get("regularMarketPrice")
+    if not isinstance(price, (int, float)):
+        log(f"Quote for {sym} has no price; skipping")
+        return None
+    prefix = "$" if meta.get("currency") == "USD" else ""
+    quote = {"n": meta.get("symbol") or sym, "p": f"{prefix}{price:,.2f}"}
+    prev = meta.get("chartPreviousClose")
+    if isinstance(prev, (int, float)) and prev:
+        quote["d"] = round((price - prev) / prev * 100.0, 2)
+    return quote
+
+
+async def add_quote_fields(payload: dict) -> None:
+    """Add "q":[{n,p,d}, ...] for each configured ticker, cached for QUOTE_TTL.
+
+    A symbol that fails to fetch keeps serving its last good value, and is
+    omitted entirely if it never succeeded.
+    """
+    syms = read_tickers_setting()
+    if not syms:
+        return
+    now = time.time()
+    stale = [s for s in syms if now - _quote_cache.get(s, (0.0, {}))[0] >= QUOTE_TTL]
+    if stale:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+            fetched = await asyncio.gather(*(fetch_quote(http, s) for s in stale))
+        for sym, quote in zip(stale, fetched):
+            if quote is not None:
+                _quote_cache[sym] = (now, quote)
+    quotes = [_quote_cache[s][1] for s in syms if s in _quote_cache]
+    if quotes:
+        payload["q"] = quotes
+
+
 def add_chime_field(payload: dict) -> None:
     """Add "c":1 to the payload when the config opts in, so the firmware may
     sound the session-reset chime. Omitted entirely when chime is off."""
@@ -246,6 +333,7 @@ async def poll_api(token: str) -> dict | None:
         }
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
+    await add_quote_fields(payload)   # adds "q":[...] iff `tickers` is set
     return payload
 
 

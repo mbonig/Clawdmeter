@@ -119,6 +119,22 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+
+    // Market quotes: "q":[{"n":"AMZN","p":"$212.34","d":1.24}, ...]. Absent on
+    // every daemon that doesn't opt in (and on hosts that never grew the
+    // feature), which just leaves the center rotator showing the clock alone.
+    // Strings are copied out — `doc` dies with this function.
+    out->quote_count = 0;
+    for (JsonObjectConst q : doc["q"].as<JsonArrayConst>()) {
+        if (out->quote_count >= MAX_QUOTES) break;
+        QuoteData* dst = &out->quotes[out->quote_count];
+        strlcpy(dst->sym, q["n"] | "", sizeof(dst->sym));
+        strlcpy(dst->price, q["p"] | "", sizeof(dst->price));
+        dst->chg_pct = q["d"] | 0.0f;
+        dst->has_chg = !q["d"].isNull();
+        if (dst->sym[0] && dst->price[0]) out->quote_count++;
+    }
+
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;

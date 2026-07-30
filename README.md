@@ -329,6 +329,17 @@ JSON payload format (written to RX):
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
 
+Optional fields, each sent only when the daemon config opts in (see `daemon/config.example`) and each safely ignored by firmware that predates it:
+
+| Field  | From            | Meaning                                                                            |
+| ------ | --------------- | ---------------------------------------------------------------------------------- |
+| `c`    | `chime = on`    | `1` = play the session-reset chime                                                 |
+| `t`    | `clock = ...`   | Local wall-clock epoch (seconds, already tz-shifted) — the device has no RTC       |
+| `tf`   | `clock = ...`   | `12` or `24`, the hour format to render                                            |
+| `q`    | `tickers = ...` | Market quotes: `[{"n":"AMZN","p":"$237.73","d":4.89}]` — symbol, formatted price, % change vs. previous close |
+
+`q` feeds the center panel on boards with spare vertical space (today only the ESP32-P4 Touch LCD-5), which cycles through the clock and each quote every 6 seconds. Smaller panels have no room for it and ignore the field. Only the macOS/Linux and Windows Python daemons send `q`; the Linux Bash daemon doesn't (it would need a JSON parser it deliberately avoids), so the panel there shows the clock alone.
+
 ## Recompiling fonts
 
 The `firmware/src/font_*.c` files are pre-compiled LVGL bitmap fonts.

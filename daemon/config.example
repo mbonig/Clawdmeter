@@ -30,3 +30,17 @@ chime = off
 #   12   = show the clock, forced 12-hour  (e.g. 6:28 PM)
 #   24   = show the clock, forced 24-hour  (e.g. 18:28)
 clock = off
+
+# Market quotes to show alongside the clock in the device's center panel, on
+# boards with room for one (today: the ESP32-P4 Touch LCD-5 — smaller panels
+# have no spare space and ignore this). The panel cycles through the clock and
+# each symbol every 6 seconds, showing the last price and the percent change
+# against the previous close.
+#   - Comma-separated; up to 3 symbols. Anything Yahoo Finance can price works
+#     (stocks, ETFs, indices like ^GSPC, crypto pairs like BTC-USD).
+#   - `spacex` is accepted as an alias for SPCX (Space Exploration Technologies
+#     Corp. on NasdaqGS). The device displays the real symbol it priced, SPCX.
+#   - Unset (default) = no quotes; the panel shows just the clock, or nothing
+#     at all if `clock` is off too.
+#   - Quotes are refreshed every 5 minutes, independent of the 60s usage poll.
+# tickers = AMZN, spacex
