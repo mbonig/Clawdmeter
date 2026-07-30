@@ -60,12 +60,17 @@ struct Layout {
     int16_t control_btn_h;           // per-button height, shared by both rows
     int16_t control_btn_gap;         // gutter between neighbouring buttons
     // Center rotator — a panel between the usage panels and whatever is
-    // anchored to the bottom, cycling through the clock and any market quotes
-    // the daemon sends. Zero height = this board has no room for one.
+    // anchored to the bottom, cycling through the clock, the software quote of
+    // the day and any market quotes the daemon sends. Zero height = this board
+    // has no room for one.
     int16_t ticker_y, ticker_h;
     const lv_font_t* ticker_value_font;   // the big line (time / price)
     const lv_font_t* ticker_label_font;   // caption above it (weekday / symbol)
     const lv_font_t* ticker_sub_font;     // line below it (date / percent change)
+    const lv_font_t* ticker_qod_font;        // quote-of-the-day body (wrapped)
+    const lv_font_t* ticker_qod_font_small;  // ...one step down, for longer text
+    const lv_font_t* ticker_qod_font_tiny;   // ...and the smallest step
+    const lv_font_t* ticker_qod_author_font;
 
     int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
@@ -283,6 +288,14 @@ static void compute_layout(const BoardCaps& c) {
         L.ticker_value_font = big ? &font_tiempos_56 : &font_tiempos_34;
         L.ticker_label_font = big ? &font_styrene_28 : &font_styrene_20;
         L.ticker_sub_font   = big ? &font_styrene_28 : &font_styrene_20;
+        // The quote body picks its size from the text length at render time
+        // (pick_qod_font) so a long quote shrinks to fit instead of being cut;
+        // these are the largest/smallest ends of that range. Tiempos (the serif)
+        // is reserved for the big numerals.
+        L.ticker_qod_font        = big ? &font_styrene_28 : &font_styrene_16;
+        L.ticker_qod_font_small  = big ? &font_styrene_20 : &font_styrene_14;
+        L.ticker_qod_font_tiny   = big ? &font_styrene_16 : &font_styrene_12;
+        L.ticker_qod_author_font = big ? &font_styrene_20 : &font_styrene_14;
     }
 }
 
@@ -332,14 +345,22 @@ static lv_obj_t* ticker_card_box = nullptr; // the faded-in text stack
 static lv_obj_t* lbl_ticker_label = nullptr;
 static lv_obj_t* lbl_ticker_value = nullptr;
 static lv_obj_t* lbl_ticker_sub = nullptr;
-static lv_obj_t* ticker_dots[1 + MAX_QUOTES] = {};  // clock card + one per quote
+// Cards are ordered clock, quote of the day, then one per market quote; each is
+// present only if its data is. ticker_card indexes the *live* list, so which
+// kind it lands on depends on what the daemon sent — ticker_card_kind() maps it.
+#define TICKER_MAX_CARDS (2 + MAX_QUOTES)
+static lv_obj_t* ticker_dots[TICKER_MAX_CARDS] = {};
 static QuoteData ticker_quotes[MAX_QUOTES] = {};
 static int       ticker_quote_count = 0;
+static char      ticker_qod_text[MAX_QOD_TEXT] = "";
+static char      ticker_qod_author[MAX_QOD_AUTHOR] = "";
 static int       ticker_card = 0;        // index into the live card list
 static uint32_t  ticker_card_ms = 0;     // when the current card came up
 static int       ticker_clock_sec = -1;  // last second rendered on the clock card
 static bool      ticker_dirty = true;    // re-render pending (new card or new data)
 #define TICKER_CARD_MS 6000              // dwell per card
+// The quote card is a paragraph, not a number — 6s isn't enough to read one.
+#define TICKER_QOD_MS  12000
 #define TICKER_FADE_MS 300
 
 // ---- Battery indicator (shared, on top) ----
@@ -689,8 +710,28 @@ static bool clock_now(struct tm* out) {
     return true;
 }
 
+enum ticker_kind_t { TICKER_CLOCK, TICKER_QOD, TICKER_QUOTE };
+
+static bool ticker_has_clock(void) { return clock_base_epoch > 0; }
+static bool ticker_has_qod(void)   { return ticker_qod_text[0] != '\0'; }
+
 static int ticker_card_count(void) {
-    return (clock_base_epoch > 0 ? 1 : 0) + ticker_quote_count;
+    return (ticker_has_clock() ? 1 : 0) + (ticker_has_qod() ? 1 : 0) + ticker_quote_count;
+}
+
+// Which kind of card index `i` of the live list is, and for market quotes which
+// one. Keeps the ordering rule in exactly one place.
+static ticker_kind_t ticker_card_kind(int i, int* quote_idx) {
+    if (ticker_has_clock()) {
+        if (i == 0) return TICKER_CLOCK;
+        i--;
+    }
+    if (ticker_has_qod()) {
+        if (i == 0) return TICKER_QOD;
+        i--;
+    }
+    *quote_idx = i;
+    return TICKER_QUOTE;
 }
 
 // One panel cycling the clock and each quote the daemon sent: caption, big
@@ -765,15 +806,71 @@ static void layout_ticker_dots(int count, int active) {
     }
 }
 
+// Font for a quote of `len` characters. Longer quotes step down a size rather
+// than being cut off — the panel is a fixed box, so something has to give, and
+// losing the second half of an aphorism is worse than reading it a bit smaller.
+// Thresholds are chars-per-line x lines for each size at this panel's width.
+static const lv_font_t* pick_qod_font(size_t len) {
+    if (len <= 90)  return L.ticker_qod_font;        // ~3 lines at the large size
+    if (len <= 190) return L.ticker_qod_font_small;
+    return L.ticker_qod_font_tiny;
+}
+
+// Single-line cards (clock, market quote) versus the wrapped paragraph of the
+// quote-of-the-day card. Switching between them retargets the same three labels
+// rather than building a second widget tree.
+static void set_ticker_card_shape(bool wrapped) {
+    if (wrapped) {
+        lv_obj_add_flag(lbl_ticker_label, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_long_mode(lbl_ticker_value, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl_ticker_value, L.content_w - 48);
+        lv_obj_set_style_text_align(lbl_ticker_value, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(lbl_ticker_value, pick_qod_font(strlen(ticker_qod_text)), 0);
+        lv_obj_set_style_text_font(lbl_ticker_sub, L.ticker_qod_author_font, 0);
+        // Nudged up so the wrapped block and the author line together sit
+        // centered, instead of the block's own center being the panel's.
+        lv_obj_align(lbl_ticker_value, LV_ALIGN_CENTER, 0, -14);
+        lv_obj_align(lbl_ticker_sub, LV_ALIGN_BOTTOM_MID, 0, -34);
+    } else {
+        lv_obj_clear_flag(lbl_ticker_label, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_long_mode(lbl_ticker_value, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(lbl_ticker_value, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_font(lbl_ticker_value, L.ticker_value_font, 0);
+        lv_obj_set_style_text_font(lbl_ticker_sub, L.ticker_sub_font, 0);
+        lv_obj_align(lbl_ticker_value, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, L.ticker_h / 4);
+    }
+}
+
 static void render_ticker_card(void) {
     const int n = ticker_card_count();
     if (n <= 0) return;
     if (ticker_card >= n) ticker_card = 0;
 
-    const bool has_clock = (clock_base_epoch > 0);
-    char buf[32];
+    int quote_idx = 0;
+    const ticker_kind_t kind = ticker_card_kind(ticker_card, &quote_idx);
+    set_ticker_card_shape(kind == TICKER_QOD);
+    char buf[MAX_QOD_TEXT + 8];
 
-    if (has_clock && ticker_card == 0) {
+    if (kind == TICKER_QOD) {
+        // Every font here is an ASCII-only subset (0x20-0x7E), so straight
+        // quotes and a hyphen — no curly quotes, em dash or ellipsis, which
+        // would render as missing glyphs. The daemon trims with "..." for the
+        // same reason.
+        snprintf(buf, sizeof(buf), "\"%s\"", ticker_qod_text);
+        lv_label_set_text(lbl_ticker_value, buf);
+        lv_obj_set_style_text_color(lbl_ticker_value, COL_TEXT, 0);
+        if (ticker_qod_author[0]) {
+            snprintf(buf, sizeof(buf), "- %s", ticker_qod_author);
+            lv_label_set_text(lbl_ticker_sub, buf);
+        } else {
+            lv_label_set_text(lbl_ticker_sub, "");
+        }
+        lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
+        return;
+    }
+
+    if (kind == TICKER_CLOCK) {
         struct tm tmv;
         if (!clock_now(&tmv)) return;
         ticker_clock_sec = tmv.tm_sec;
@@ -796,7 +893,7 @@ static void render_ticker_card(void) {
         return;
     }
 
-    const QuoteData* q = &ticker_quotes[ticker_card - (has_clock ? 1 : 0)];
+    const QuoteData* q = &ticker_quotes[quote_idx];
     lv_label_set_text(lbl_ticker_label, q->sym);
     lv_label_set_text(lbl_ticker_value, q->price);
     if (q->has_chg) {
@@ -809,9 +906,10 @@ static void render_ticker_card(void) {
     }
 }
 
-// Called every loop from ui_tick_anim(). Advances the card on a timer, keeps the
-// clock card's seconds moving, and hides the panel outright when the daemon has
-// sent neither a clock nor any quotes (an opt-in feature that's simply off).
+// Called every loop from ui_tick_anim(). Advances the card on its own dwell,
+// keeps the clock card's seconds moving, and hides the panel outright when the
+// daemon sent no clock, no quote of the day and no market quotes — i.e. every
+// card is opt-in and none were opted into.
 static void ticker_tick(uint32_t now) {
     if (!ticker_panel) return;
     static int shown_count = -1;
@@ -830,7 +928,10 @@ static void ticker_tick(uint32_t now) {
         if (ticker_card >= n) ticker_card = 0;
         ticker_dirty = true;
     }
-    if (n > 1 && now - ticker_card_ms >= TICKER_CARD_MS) {
+    int cur_quote_idx = 0;
+    const ticker_kind_t cur_kind = ticker_card_kind(ticker_card, &cur_quote_idx);
+    const uint32_t dwell = (cur_kind == TICKER_QOD) ? TICKER_QOD_MS : TICKER_CARD_MS;
+    if (n > 1 && now - ticker_card_ms >= dwell) {
         ticker_card = (ticker_card + 1) % n;
         ticker_card_ms = now;
         ticker_dirty = fade = true;
@@ -844,7 +945,7 @@ static void ticker_tick(uint32_t now) {
         return;
     }
     // Between switches only the clock card needs repainting, once per second.
-    if (clock_base_epoch > 0 && ticker_card == 0) {
+    if (cur_kind == TICKER_CLOCK) {
         struct tm tmv;
         if (clock_now(&tmv) && tmv.tm_sec != ticker_clock_sec) render_ticker_card();
     }
@@ -1167,6 +1268,8 @@ void ui_update(const UsageData* data) {
     // latest payload rather than accumulating stale symbols.
     ticker_quote_count = (data->quote_count < MAX_QUOTES) ? data->quote_count : MAX_QUOTES;
     for (int i = 0; i < ticker_quote_count; i++) ticker_quotes[i] = data->quotes[i];
+    strlcpy(ticker_qod_text, data->qod_text, sizeof(ticker_qod_text));
+    strlcpy(ticker_qod_author, data->qod_author, sizeof(ticker_qod_author));
     ticker_dirty = true;   // refresh the visible card in place if it's a quote
 
     int s_pct = (int)(data->session_pct + 0.5f);

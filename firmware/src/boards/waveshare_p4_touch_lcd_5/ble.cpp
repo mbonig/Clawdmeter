@@ -300,6 +300,17 @@ void ble_init(void) {
     // for GATT access only and never enrolls HID.
     BLESecurity::setAuthenticationMode(true, false, true);  // bonding, no MITM, SC
 
+    // Raise the preferred ATT MTU. The precompiled NimBLE in
+    // framework-arduinoespressif32-libs ships CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256,
+    // and since sdkconfig can't be changed for a precompiled stack, that default
+    // was capping the negotiated MTU at 256 — i.e. 253 usable bytes in a
+    // write-without-response, which is not enough for the usage payload plus the
+    // center rotator's market quotes AND a quote of the day (the daemon was
+    // trimming the quote mid-sentence to fit). macOS offers 527, so asking for
+    // more here is enough. Kept just under BLE_BUF_SIZE (512) so a maximal write
+    // can never be truncated by the RX buffer instead.
+    BLEDevice::setMTU(BLE_BUF_SIZE - 3);
+
     load_owner();
     prune_foreign_bonds();
 

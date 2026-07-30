@@ -9,6 +9,7 @@ later plans.
 import asyncio
 import calendar
 import datetime
+import html
 import json
 import logging
 import logging.handlers
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -72,6 +74,24 @@ MAX_TICKERS = 3
 TICKER_ALIASES = {"spacex": "SPCX"}
 # sym -> (fetched_at, payload dict)
 _quote_cache: dict[str, tuple[float, dict]] = {}
+
+# Software quote of the day, scraped from softwarequotes.com — it publishes no
+# RSS feed, JSON API or embed, so the page markup is the only interface. Both
+# patterns below are anchored on the class names wrapping the quote; if the site
+# restyles, fetch_quote_of_day() logs and returns None rather than sending junk.
+QOD_URL = "https://softwarequotes.com/quote-of-the-day"
+QOD_TEXT_RE = re.compile(r'quote__center.*?<p>(.*?)</p>', re.S)
+QOD_AUTHOR_RE = re.compile(r'quote__author.*?<a[^>]*>(.*?)</a>', re.S)
+# It changes once a day, so re-scraping on the usage-poll cadence would be 1440
+# requests/day for one string. Six hours still catches the rollover promptly.
+QOD_TTL = 6 * 3600
+# A sanity bound, not a fitting mechanism: the device drops to a smaller font as
+# the text grows, so anything up to ~300 characters wraps into its panel intact.
+# Quotes are never shortened to fit a BLE write (see Session.write_payload) —
+# only a genuinely essay-length one gets cut here, at a word boundary.
+QOD_MAX_CHARS = 300
+# (fetched_at, {"t": text, "a": author}) — a single entry, unlike _quote_cache.
+_qod_cache: tuple[float, dict] | None = None
 
 
 def _build_file_logger() -> logging.Logger | None:
@@ -139,6 +159,28 @@ def read_chime_setting() -> str:
                     continue
                 key, val = line.split("=", 1)
                 if key.strip().lower() == "chime":
+                    val = val.strip().lower()
+                    if val in ("off", "on"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
+def read_config_flag(key: str) -> str:
+    """Read a plain on/off option from the config file, defaulting to "off".
+
+    The older `chime`/`clock` readers each inline this parsing because they
+    predate having more than one option; new boolean options use this.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                name, val = line.split("=", 1)
+                if name.strip().lower() == key:
                     val = val.strip().lower()
                     if val in ("off", "on"):
                         return val
@@ -270,6 +312,92 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+# The device's fonts are ASCII-only (0x20-0x7E) subsets, and typographic
+# punctuation is exactly what a quotes site is full of. Fold the common
+# offenders to their ASCII equivalents; anything still non-ASCII after NFKD
+# decomposition (so accented letters keep their base form) is dropped.
+_ASCII_SUBS = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "«": '"', "»": '"',
+    "–": "-", "—": "-", "‑": "-", "−": "-",
+    "…": "...", " ": " ", "′": "'", "″": '"',
+}
+
+
+def _asciify(text: str) -> str:
+    for src, dst in _ASCII_SUBS.items():
+        text = text.replace(src, dst)
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def _strip_markup(fragment: str) -> str:
+    """Collapse an HTML fragment to a single line of ASCII-safe plain text."""
+    text = html.unescape(re.sub(r"<[^>]+>", "", fragment))
+    return re.sub(r"\s+", " ", _asciify(text)).strip()
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Trim to `limit` characters on a word boundary, with a trailing "...".
+
+    Three ASCII dots, not U+2026: the device's fonts are 0x20-0x7E subsets, so a
+    real ellipsis has no glyph and renders as nothing.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 3].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")].rstrip()
+    return cut.rstrip(",;:.") + "..."
+
+
+async def fetch_quote_of_day() -> dict | None:
+    """Scrape today's software quote of the day, or None if it can't be read."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+            resp = await http.get(QOD_URL, headers=QUOTE_HEADERS)
+            resp.raise_for_status()
+            page = resp.text
+    except httpx.HTTPError as e:
+        log(f"Quote-of-the-day fetch failed: {e}")
+        return None
+
+    text_m = QOD_TEXT_RE.search(page)
+    if not text_m:
+        log("Quote-of-the-day page markup changed; no quote found")
+        return None
+    text = _strip_markup(text_m.group(1))
+    if not text:
+        log("Quote-of-the-day text was empty")
+        return None
+    quote = {"t": _shorten(text, QOD_MAX_CHARS)}
+    author_m = QOD_AUTHOR_RE.search(page)
+    if author_m:
+        author = _shorten(_strip_markup(author_m.group(1)), 30)
+        if author:
+            quote["a"] = author
+    return quote
+
+
+async def add_quote_of_day_field(payload: dict) -> None:
+    """Add "qd":{"t","a"} to the payload when the config opts in.
+
+    Cached for QOD_TTL; a failed scrape keeps serving the last good quote, since
+    a day-old software aphorism is no less true than today's.
+    """
+    global _qod_cache
+    if read_config_flag("quote_of_day") != "on":
+        return
+    if _qod_cache is None or time.time() - _qod_cache[0] >= QOD_TTL:
+        quote = await fetch_quote_of_day()
+        if quote is not None:
+            _qod_cache = (time.time(), quote)
+    if _qod_cache is not None:
+        # A copy: the payload is handed to the writer, which may rewrite the
+        # field, and the cache must stay pristine for the next poll.
+        payload["qd"] = dict(_qod_cache[1])
+
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -334,6 +462,7 @@ async def poll_api(token: str) -> dict | None:
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     await add_quote_fields(payload)   # adds "q":[...] iff `tickers` is set
+    await add_quote_of_day_field(payload)   # adds "qd":{...} iff the config opts in
     return payload
 
 
@@ -479,8 +608,21 @@ class Session:
         except (BleakError, ValueError, OSError) as e:
             log(f"Refresh subscription unavailable: {e}")
 
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
+    def write_limit(self) -> int:
+        """Bytes that fit one write-without-response on this link.
+
+        The firmware's RX buffer is 512B, but a single unacknowledged write can
+        only carry ATT_MTU-3 — so the real ceiling is whatever MTU the host and
+        device negotiated (macOS commonly lands well under 512). bleak exposes
+        it per-backend and can raise if the link went away mid-call, hence the
+        conservative fallback.
+        """
+        try:
+            return max(20, self.client.mtu_size - 3)
+        except Exception:  # noqa: BLE001 - backend-specific failures, all non-fatal
+            return 180
+
+    async def _write(self, data: bytes) -> bool:
         log(f"Sending: {data.decode()}")
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
@@ -494,6 +636,34 @@ class Session:
             # silent-freeze failure mode, SC#2 field report).
             log(f"Write failed: {e}")
             return False
+
+    async def write_payload(self, payload: dict) -> bool:
+        """Write the payload, splitting the quote out if it won't fit in one go.
+
+        A write-without-response can't span packets, so an over-MTU payload has
+        to lose something. The quote is never shortened to make room — half an
+        aphorism is worse than none — so instead the usage payload goes out with
+        `"qd":1`, telling the firmware "your quote still stands, an update is
+        coming", and the quote follows as its own `{"qd":{...}}` write that the
+        firmware merges without touching the usage numbers.
+        """
+        limit = self.write_limit()
+        quote = payload.get("qd")
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        if len(data) <= limit or not isinstance(quote, dict):
+            return await self._write(data)
+
+        solo = json.dumps({"qd": quote}, separators=(",", ":")).encode()
+        if len(solo) > limit:
+            # Nothing sensible left to do: dropping the quote entirely at least
+            # keeps the usage numbers whole and honest.
+            log(f"Quote needs {len(solo)}B but only {limit}B fit a write; skipping it")
+            payload.pop("qd", None)
+            return await self._write(json.dumps(payload, separators=(",", ":")).encode())
+
+        payload["qd"] = 1   # sentinel: keep the current quote, update follows
+        first = json.dumps(payload, separators=(",", ":")).encode()
+        return await self._write(first) and await self._write(solo)
 
 
 def _extract_access_token(blob: str) -> str | None:

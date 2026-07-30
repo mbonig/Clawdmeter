@@ -44,3 +44,13 @@ clock = off
 #     at all if `clock` is off too.
 #   - Quotes are refreshed every 5 minutes, independent of the 60s usage poll.
 # tickers = AMZN, spacex
+
+# Add the software quote of the day (from softwarequotes.com) to that same
+# center panel, as its own card. Shown for 12s per cycle rather than 6s, since
+# it's a sentence to read rather than a number to glance at.
+#   off = no quote card (default)
+#   on  = fetch the quote of the day, refreshed every 6 hours
+# Long quotes are shown in a smaller font rather than being cut short, and if
+# one won't fit in a single Bluetooth write alongside the usage numbers it's
+# sent as its own write instead of being shortened.
+quote_of_day = off

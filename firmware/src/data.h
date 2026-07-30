@@ -13,6 +13,13 @@ struct QuoteData {
     bool  has_chg;    // false when the daemon couldn't compute a change
 };
 
+// Software quote of the day, scraped host-side. Sized to the longest text the
+// rotator can wrap into its panel at its smallest font — the quote is never
+// shortened to fit a BLE write (the daemon sends it as a separate write when it
+// has to), so this buffer has to hold whatever the daemon considers sendable.
+#define MAX_QOD_TEXT 320
+#define MAX_QOD_AUTHOR 32
+
 struct UsageData {
     float session_pct;       // utilization 0-100 (5h window Pro/Max; spending % Enterprise)
     int session_reset_mins;  // minutes until reset
@@ -28,6 +35,8 @@ struct UsageData {
     int  clock_fmt;          // 12 or 24 (hour format from daemon); defaults to 24
     QuoteData quotes[MAX_QUOTES];  // market quotes from the daemon (may be empty)
     int  quote_count;        // number of populated entries in quotes[]
+    char qod_text[MAX_QOD_TEXT];      // quote of the day; empty = not provided
+    char qod_author[MAX_QOD_AUTHOR];  // its author; may be empty even with text
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
