@@ -97,13 +97,32 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
+// Outcome of parsing one BLE write. MERGE exists because the daemon may send the
+// quote of the day as its own write (rather than shortening it to share one with
+// the usage numbers) — that write must update the display without being fed to
+// the usage-rate tracker as if it were a fresh usage sample.
+enum parse_result_t { PARSE_ERROR, PARSE_USAGE, PARSE_MERGE };
+
 // Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+static parse_result_t parse_json(const char* json, UsageData* out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
+        return PARSE_ERROR;
+    }
+
+    // Supplementary write: a payload carrying "qd" but no usage fields is the
+    // quote of the day sent on its own, because it wouldn't fit one BLE write
+    // alongside the numbers (the daemon splits rather than shortening the
+    // quote). Merge just that and leave every other field — and the usage
+    // freshness they imply — exactly as the last full payload left it.
+    JsonVariantConst qd = doc["qd"];
+    if (doc["s"].isNull() && doc["ok"].isNull()) {
+        if (!qd.is<JsonObjectConst>()) return PARSE_ERROR;
+        strlcpy(out->qod_text, qd["t"] | "", sizeof(out->qod_text));
+        strlcpy(out->qod_author, qd["a"] | "", sizeof(out->qod_author));
+        return PARSE_MERGE;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -119,9 +138,37 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+
+    // Market quotes: "q":[{"n":"AMZN","p":"$212.34","d":1.24}, ...]. Absent on
+    // every daemon that doesn't opt in (and on hosts that never grew the
+    // feature), which just leaves the center rotator showing the clock alone.
+    // Strings are copied out — `doc` dies with this function.
+    out->quote_count = 0;
+    for (JsonObjectConst q : doc["q"].as<JsonArrayConst>()) {
+        if (out->quote_count >= MAX_QUOTES) break;
+        QuoteData* dst = &out->quotes[out->quote_count];
+        strlcpy(dst->sym, q["n"] | "", sizeof(dst->sym));
+        strlcpy(dst->price, q["p"] | "", sizeof(dst->price));
+        dst->chg_pct = q["d"] | 0.0f;
+        dst->has_chg = !q["d"].isNull();
+        if (dst->sym[0] && dst->price[0]) out->quote_count++;
+    }
+
+    // Software quote of the day. Three states: an object carries a new quote, a
+    // bare sentinel ("qd":1) means "keep the one you have, a separate write is
+    // bringing the update", and absent means the host isn't sending quotes at
+    // all — the only case that clears the card.
+    if (qd.is<JsonObjectConst>()) {
+        strlcpy(out->qod_text, qd["t"] | "", sizeof(out->qod_text));
+        strlcpy(out->qod_author, qd["a"] | "", sizeof(out->qod_author));
+    } else if (qd.isNull()) {
+        out->qod_text[0] = '\0';
+        out->qod_author[0] = '\0';
+    }
+
     out->ok = doc["ok"] | false;
     out->valid = true;
-    return true;
+    return PARSE_USAGE;
 }
 
 // ---- Serial command buffer ----
@@ -375,26 +422,32 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_play_reset();
-            }
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
+        parse_result_t res = parse_json(ble_get_data(), &usage);
+        if (res == PARSE_ERROR) {
+            ble_send_nack();
+        } else {
+            // Only a real usage payload is a rate sample. A MERGE write carries
+            // the same session_pct the previous write already reported, so
+            // sampling it again would dilute the rate and re-test for a reset.
+            if (res == PARSE_USAGE) {
+                int g_before = usage_rate_group();
+                bool session_reset = usage_rate_sample(usage.session_pct);
+                int g_after = usage_rate_group();
+                // 5-hour session limit refilled → chime so the user knows they can
+                // use Claude again (no-op on boards without a buzzer). Gated on the
+                // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+                if (session_reset && usage.chime) {
+                    Serial.println("session reset detected — chime");
+                    sound_hal_play_reset();
+                }
+                if (g_after != g_before) {
+                    Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+                        g_before, g_after, usage.session_pct);
+                    if (splash_is_active()) splash_pick_for_current_rate();
+                }
             }
             ui_update(&usage);
             ble_send_ack();
-        } else {
-            ble_send_nack();
         }
     }
 

@@ -329,6 +329,22 @@ JSON payload format (written to RX):
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
 
+Optional fields, each sent only when the daemon config opts in (see `daemon/config.example`) and each safely ignored by firmware that predates it:
+
+| Field  | From            | Meaning                                                                            |
+| ------ | --------------- | ---------------------------------------------------------------------------------- |
+| `c`    | `chime = on`    | `1` = play the session-reset chime                                                 |
+| `t`    | `clock = ...`   | Local wall-clock epoch (seconds, already tz-shifted) — the device has no RTC       |
+| `tf`   | `clock = ...`   | `12` or `24`, the hour format to render                                            |
+| `q`    | `tickers = ...` | Market quotes: `[{"n":"AMZN","p":"$237.73","d":4.89}]` — symbol, formatted price, % change vs. previous close |
+| `qd`   | `quote_of_day = on` | Software quote: `{"t":"...","a":"Dijkstra"}` — text and author, rotating every 5 minutes. `"qd":1` instead of an object means "keep the current quote, an update follows in its own write" |
+
+`q` and `qd` feed the center panel on boards with spare vertical space (today only the ESP32-P4 Touch LCD-5), which cycles through the clock, a software quote (12s) and each market quote (6s each). Smaller panels have no room for it and ignore both fields. Only the macOS/Linux and Windows Python daemons send them; the Linux Bash daemon doesn't (it would need a JSON parser it deliberately avoids), so the panel there shows the clock alone.
+
+All text is pre-folded to ASCII host-side — the device's fonts are 0x20–0x7E subsets, so curly quotes, em dashes and ellipses would render as blanks.
+
+A single write-without-response carries only ATT MTU−3 bytes, so the daemon sizes each payload against the MTU bleak reports. **Quotes are never shortened to make room**: when everything doesn't fit, the usage payload goes out with the `"qd":1` sentinel and the quote follows as its own `{"qd":{...}}` write, which the firmware merges without touching the usage numbers. The device also drops to a smaller font for a long quote rather than clipping it.
+
 ## Recompiling fonts
 
 The `firmware/src/font_*.c` files are pre-compiled LVGL bitmap fonts.

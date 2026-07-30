@@ -9,16 +9,19 @@ later plans.
 import asyncio
 import calendar
 import datetime
+import html
 import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -59,6 +62,52 @@ API_BODY = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 
+# Market quotes for the device's center rotator (opt-in via `tickers` in the
+# config) — mirrors the macOS/Linux daemon; see its comments for why Yahoo's
+# chart endpoint is used and why prices are formatted host-side.
+QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+QUOTE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+QUOTE_TTL = 300
+MAX_TICKERS = 3
+# Convenience aliases for company names that aren't their ticker (SpaceX listed
+# on NasdaqGS as SPCX in June 2026). The device always shows the real symbol
+# that was priced, never the alias it was typed as.
+TICKER_ALIASES = {"spacex": "SPCX"}
+# sym -> (fetched_at, payload dict)
+_quote_cache: dict[str, tuple[float, dict]] = {}
+
+# Software quotes scraped from softwarequotes.com — it publishes no RSS feed,
+# JSON API or embed, so the page markup is the only interface. The patterns below
+# are anchored on the class names wrapping each quote; if the site restyles,
+# fetch_quote_pool() logs and returns nothing rather than sending junk.
+QOD_URL = "https://softwarequotes.com/quote-of-the-day"
+QOD_HOME_URL = "https://softwarequotes.com/"
+QOD_TOPICS_URL = "https://softwarequotes.com/topics"
+QOD_BLOCK_SPLIT_RE = re.compile(r'<div class="quote[ "]')
+QOD_TEXT_RE = re.compile(r'quote__center.*?<p>(.*?)</p>', re.S)
+QOD_AUTHOR_RE = re.compile(r'quote__author.*?<a[^>]*>(.*?)</a>', re.S)
+QOD_TOPIC_RE = re.compile(r'href="https://softwarequotes\.com/(topic/[^"?#]+)"')
+# The device shows a different quote every QOD_ROTATE seconds, which needs a pool
+# of them: /quote-of-the-day serves one quote for the whole day, so rotating on
+# that page alone would just re-send the same string. The site has no listing or
+# random endpoint either, so the pool is assembled from topic pages. Those are a
+# long tail — the ~265 topics in /topics mostly hold 1-6 quotes each, while the
+# handful the site features on its home page hold 20+ — so the sample is seeded
+# with the featured ones and topped up at random for variety. The actual quote of
+# the day always leads the pool.
+QOD_ROTATE = 300
+QOD_POOL_TTL = 6 * 3600
+QOD_FEATURED_TOPICS = 10   # from the home page — the densest topic pages
+QOD_RANDOM_TOPICS = 6      # from /topics — rotates the mix between rebuilds
+# A sanity bound, not a fitting mechanism: the device drops to a smaller font as
+# the text grows, so anything up to ~300 characters wraps into its panel intact.
+# Quotes are never shortened to fit a BLE write (see Session.write_payload) —
+# only a genuinely essay-length one gets cut here, at a word boundary.
+QOD_MAX_CHARS = 300
+_qod_pool: list[dict] = []   # [{"t": text, "a": author}, ...], quote of the day first
+_qod_pool_at = 0.0           # when the pool was built
+_qod_index = 0               # which one is currently on the device
+_qod_shown_at = 0.0          # when it went out, for the QOD_ROTATE timer
 
 def _build_file_logger() -> logging.Logger | None:
     """Create a rotating file logger for field diagnostics, or None.
@@ -133,6 +182,28 @@ def read_chime_setting() -> str:
     return "off"
 
 
+def read_config_flag(key: str) -> str:
+    """Read a plain on/off option from the config file, defaulting to "off".
+
+    The older `chime`/`clock` readers each inline this parsing because they
+    predate having more than one option; new boolean options use this.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                name, val = line.split("=", 1)
+                if name.strip().lower() == key:
+                    val = val.strip().lower()
+                    if val in ("off", "on"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
 def read_clock_setting() -> str:
     """Read the `clock` option from the config file. One of: off|auto|12|24.
 
@@ -152,6 +223,79 @@ def read_clock_setting() -> str:
     except OSError:
         pass
     return "off"
+
+
+def read_tickers_setting() -> list[str]:
+    """Read the `tickers` option: market symbols for the device's center rotator.
+
+    Comma-separated, aliases resolved, capped at MAX_TICKERS. Empty (default)
+    means no quotes are sent.
+    """
+    raw = ""
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "tickers":
+                    raw = val.strip()
+    except OSError:
+        return []
+    syms: list[str] = []
+    for part in raw.split(","):
+        sym = part.strip()
+        if not sym:
+            continue
+        sym = TICKER_ALIASES.get(sym.lower(), sym).upper()
+        if sym not in syms:
+            syms.append(sym)
+    return syms[:MAX_TICKERS]
+
+
+async def fetch_quote(http: httpx.AsyncClient, sym: str) -> dict | None:
+    """Fetch one symbol as the device's wire form, or None if it can't be priced."""
+    try:
+        resp = await http.get(QUOTE_URL.format(sym=sym), headers=QUOTE_HEADERS)
+        resp.raise_for_status()
+        meta = resp.json()["chart"]["result"][0]["meta"]
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
+        log(f"Quote fetch failed for {sym}: {e}")
+        return None
+
+    price = meta.get("regularMarketPrice")
+    if not isinstance(price, (int, float)):
+        log(f"Quote for {sym} has no price; skipping")
+        return None
+    prefix = "$" if meta.get("currency") == "USD" else ""
+    quote = {"n": meta.get("symbol") or sym, "p": f"{prefix}{price:,.2f}"}
+    prev = meta.get("chartPreviousClose")
+    if isinstance(prev, (int, float)) and prev:
+        quote["d"] = round((price - prev) / prev * 100.0, 2)
+    return quote
+
+
+async def add_quote_fields(payload: dict) -> None:
+    """Add "q":[{n,p,d}, ...] for each configured ticker, cached for QUOTE_TTL.
+
+    A symbol that fails to fetch keeps serving its last good value, and is
+    omitted entirely if it never succeeded.
+    """
+    syms = read_tickers_setting()
+    if not syms:
+        return
+    now = time.time()
+    stale = [s for s in syms if now - _quote_cache.get(s, (0.0, {}))[0] >= QUOTE_TTL]
+    if stale:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+            fetched = await asyncio.gather(*(fetch_quote(http, s) for s in stale))
+        for sym, quote in zip(stale, fetched):
+            if quote is not None:
+                _quote_cache[sym] = (now, quote)
+    quotes = [_quote_cache[s][1] for s in syms if s in _quote_cache]
+    if quotes:
+        payload["q"] = quotes
 
 
 def add_chime_field(payload: dict) -> None:
@@ -181,6 +325,151 @@ def add_clock_fields(payload: dict) -> None:
     tf = 24 if clock == "24" else 12 if clock == "12" else detect_hour_format()
     payload["t"] = int(time.time()) + time.localtime().tm_gmtoff
     payload["tf"] = tf
+
+
+# The device's fonts are ASCII-only (0x20-0x7E) subsets, and typographic
+# punctuation is exactly what a quotes site is full of. Fold the common
+# offenders to their ASCII equivalents; anything still non-ASCII after NFKD
+# decomposition (so accented letters keep their base form) is dropped.
+_ASCII_SUBS = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "«": '"', "»": '"',
+    "–": "-", "—": "-", "‑": "-", "−": "-",
+    "…": "...", " ": " ", "′": "'", "″": '"',
+}
+
+
+def _asciify(text: str) -> str:
+    for src, dst in _ASCII_SUBS.items():
+        text = text.replace(src, dst)
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def _strip_markup(fragment: str) -> str:
+    """Collapse an HTML fragment to a single line of ASCII-safe plain text."""
+    text = html.unescape(re.sub(r"<[^>]+>", "", fragment))
+    return re.sub(r"\s+", " ", _asciify(text)).strip()
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Trim to `limit` characters on a word boundary, with a trailing "...".
+
+    Three ASCII dots, not U+2026: the device's fonts are 0x20-0x7E subsets, so a
+    real ellipsis has no glyph and renders as nothing.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 3].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")].rstrip()
+    return cut.rstrip(",;:.") + "..."
+
+
+def parse_quotes(page: str) -> list[dict]:
+    """Every quote on a softwarequotes.com page, as device payload dicts.
+
+    Pages are split into per-quote blocks first, so a text can't be paired with
+    the next quote's author when one of them is missing.
+    """
+    quotes = []
+    for block in QOD_BLOCK_SPLIT_RE.split(page)[1:]:
+        text_m = QOD_TEXT_RE.search(block)
+        if not text_m:
+            continue
+        text = _strip_markup(text_m.group(1))
+        if not text:
+            continue
+        quote = {"t": _shorten(text, QOD_MAX_CHARS)}
+        author_m = QOD_AUTHOR_RE.search(block)
+        if author_m:
+            author = _shorten(_strip_markup(author_m.group(1)), 30)
+            if author:
+                quote["a"] = author
+        quotes.append(quote)
+    return quotes
+
+
+async def _get_page(http: httpx.AsyncClient, url: str) -> str:
+    """GET a page, returning "" on any transport or HTTP failure."""
+    try:
+        resp = await http.get(url, headers=QUOTE_HEADERS)
+        resp.raise_for_status()
+        return resp.text
+    except httpx.HTTPError as e:
+        log(f"Quote page fetch failed ({url}): {e}")
+        return ""
+
+
+def _pick_topics(home_page: str, topics_page: str) -> list[str]:
+    """Topic paths to scrape: the home page's featured ones plus random others."""
+    featured = list(dict.fromkeys(QOD_TOPIC_RE.findall(home_page)))[:QOD_FEATURED_TOPICS]
+    others = [t for t in dict.fromkeys(QOD_TOPIC_RE.findall(topics_page))
+              if t not in featured]
+    extra = random.sample(others, min(QOD_RANDOM_TOPICS, len(others))) if others else []
+    return featured + extra
+
+
+async def fetch_quote_pool() -> list[dict]:
+    """Build the rotation pool: the quote of the day, then a sample of topics.
+
+    Deduplicated by text, and shuffled below the first entry so consecutive
+    quotes don't all come from the same topic page. Empty if the site is
+    unreachable or its markup moved — callers keep their previous pool.
+    """
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+        qod_page, home_page, topics_page = await asyncio.gather(
+            _get_page(http, QOD_URL),
+            _get_page(http, QOD_HOME_URL),
+            _get_page(http, QOD_TOPICS_URL),
+        )
+        pool = parse_quotes(qod_page)
+        topics = _pick_topics(home_page, topics_page)
+        if topics:
+            pages = await asyncio.gather(
+                *(_get_page(http, f"https://softwarequotes.com/{t}") for t in topics))
+            rest = [q for page in pages for q in parse_quotes(page)]
+            random.shuffle(rest)
+            pool += rest
+
+    seen, unique = set(), []
+    for quote in pool:
+        if quote["t"] not in seen:
+            seen.add(quote["t"])
+            unique.append(quote)
+    if not unique:
+        log("Quote pool came back empty; site unreachable or markup changed")
+    return unique
+
+
+async def add_quote_of_day_field(payload: dict) -> None:
+    """Add "qd":{"t","a"} to the payload when the config opts in.
+
+    Advances through the pool every QOD_ROTATE seconds — in practice on the next
+    poll after that elapses, since the device only hears from us once a minute.
+    A failed rebuild keeps the existing pool rotating rather than going blank.
+    """
+    global _qod_pool, _qod_pool_at, _qod_index, _qod_shown_at
+    if read_config_flag("quote_of_day") != "on":
+        return
+    now = time.time()
+    rebuilt = False
+    if not _qod_pool or now - _qod_pool_at >= QOD_POOL_TTL:
+        pool = await fetch_quote_pool()
+        if pool:
+            _qod_pool, _qod_pool_at = pool, now
+            _qod_index, _qod_shown_at = 0, now
+            rebuilt = True
+            log(f"Quote pool rebuilt: {len(pool)} quotes")
+    if not _qod_pool:
+        return
+    # A fresh pool starts on its first entry — the actual quote of the day —
+    # rather than immediately stepping off it.
+    if not rebuilt and now - _qod_shown_at >= QOD_ROTATE:
+        _qod_index = (_qod_index + 1) % len(_qod_pool)
+        _qod_shown_at = now
+    # A copy: the payload is handed to the writer, which may rewrite the field,
+    # and the pool must stay pristine for the next poll.
+    payload["qd"] = dict(_qod_pool[_qod_index])
 
 
 async def poll_api(token: str) -> dict | None:
@@ -246,6 +535,8 @@ async def poll_api(token: str) -> dict | None:
         }
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
+    await add_quote_fields(payload)   # adds "q":[...] iff `tickers` is set
+    await add_quote_of_day_field(payload)   # adds "qd":{...} iff the config opts in
     return payload
 
 
@@ -391,8 +682,21 @@ class Session:
         except (BleakError, ValueError, OSError) as e:
             log(f"Refresh subscription unavailable: {e}")
 
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
+    def write_limit(self) -> int:
+        """Bytes that fit one write-without-response on this link.
+
+        The firmware's RX buffer is 512B, but a single unacknowledged write can
+        only carry ATT_MTU-3 — so the real ceiling is whatever MTU the host and
+        device negotiated (macOS commonly lands well under 512). bleak exposes
+        it per-backend and can raise if the link went away mid-call, hence the
+        conservative fallback.
+        """
+        try:
+            return max(20, self.client.mtu_size - 3)
+        except Exception:  # noqa: BLE001 - backend-specific failures, all non-fatal
+            return 180
+
+    async def _write(self, data: bytes) -> bool:
         log(f"Sending: {data.decode()}")
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
@@ -406,6 +710,34 @@ class Session:
             # silent-freeze failure mode, SC#2 field report).
             log(f"Write failed: {e}")
             return False
+
+    async def write_payload(self, payload: dict) -> bool:
+        """Write the payload, splitting the quote out if it won't fit in one go.
+
+        A write-without-response can't span packets, so an over-MTU payload has
+        to lose something. The quote is never shortened to make room — half an
+        aphorism is worse than none — so instead the usage payload goes out with
+        `"qd":1`, telling the firmware "your quote still stands, an update is
+        coming", and the quote follows as its own `{"qd":{...}}` write that the
+        firmware merges without touching the usage numbers.
+        """
+        limit = self.write_limit()
+        quote = payload.get("qd")
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        if len(data) <= limit or not isinstance(quote, dict):
+            return await self._write(data)
+
+        solo = json.dumps({"qd": quote}, separators=(",", ":")).encode()
+        if len(solo) > limit:
+            # Nothing sensible left to do: dropping the quote entirely at least
+            # keeps the usage numbers whole and honest.
+            log(f"Quote needs {len(solo)}B but only {limit}B fit a write; skipping it")
+            payload.pop("qd", None)
+            return await self._write(json.dumps(payload, separators=(",", ":")).encode())
+
+        payload["qd"] = 1   # sentinel: keep the current quote, update follows
+        first = json.dumps(payload, separators=(",", ":")).encode()
+        return await self._write(first) and await self._write(solo)
 
 
 def _extract_access_token(blob: str) -> str | None:
