@@ -33,6 +33,12 @@ struct UsageData {
     char reset_date[12];     // formatted reset date e.g. "Jul 1" (Enterprise)
     long clock_epoch;        // local wall-clock epoch (s) from daemon; 0 = not provided
     int  clock_fmt;          // 12 or 24 (hour format from daemon); defaults to 24
+    // Minutes to add to clock_epoch to get US Eastern / UTC, so the clock card
+    // can show both in small print without the device knowing any tz rules.
+    // 0 means "same as local" — which is also what an older daemon that doesn't
+    // send them produces, and in both cases that line is simply not rendered.
+    int  clock_et_off_min;
+    int  clock_utc_off_min;
     QuoteData quotes[MAX_QUOTES];  // market quotes from the daemon (may be empty)
     int  quote_count;        // number of populated entries in quotes[]
     char qod_text[MAX_QOD_TEXT];      // quote of the day; empty = not provided

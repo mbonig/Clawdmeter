@@ -137,6 +137,11 @@ static parse_result_t parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    // Offsets from that local time, in minutes. Absent (older daemon, or the
+    // host already being in that zone) leaves them 0 and the device drops the
+    // ET/UTC line rather than printing the same time twice.
+    out->clock_et_off_min = doc["te"] | 0;
+    out->clock_utc_off_min = doc["tu"] | 0;
 
     // Market quotes: "q":[{"n":"AMZN","p":"$212.34","d":1.24}, ...]. Absent on
     // every daemon that doesn't opt in (and on hosts that never grew the

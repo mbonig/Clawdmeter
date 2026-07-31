@@ -67,6 +67,7 @@ struct Layout {
     const lv_font_t* ticker_value_font;   // the big line (time / price)
     const lv_font_t* ticker_label_font;   // caption above it (weekday / symbol)
     const lv_font_t* ticker_sub_font;     // line below it (date / percent change)
+    const lv_font_t* ticker_zone_font;    // clock card's small-print ET/UTC line
     const lv_font_t* ticker_qod_font;        // quote-of-the-day body (wrapped)
     const lv_font_t* ticker_qod_font_small;  // ...one step down, for longer text
     const lv_font_t* ticker_qod_font_tiny;   // ...and the smallest step
@@ -288,6 +289,7 @@ static void compute_layout(const BoardCaps& c) {
         L.ticker_value_font = big ? &font_tiempos_56 : &font_tiempos_34;
         L.ticker_label_font = big ? &font_styrene_28 : &font_styrene_20;
         L.ticker_sub_font   = big ? &font_styrene_28 : &font_styrene_20;
+        L.ticker_zone_font  = big ? &font_styrene_24 : &font_styrene_16;
         // The quote body picks its size from the text length at render time
         // (pick_qod_font) so a long quote shrinks to fit instead of being cut;
         // these are the largest/smallest ends of that range. Tiempos (the serif)
@@ -320,6 +322,10 @@ static lv_obj_t* lbl_title;
 static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
+// Minutes to add to the local clock for US Eastern / UTC (see data.h). Both 0
+// (no daemon support, or the host is already in that zone) hides that line.
+static int      clock_et_off_min = 0;
+static int      clock_utc_off_min = 0;
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
@@ -345,6 +351,7 @@ static lv_obj_t* ticker_card_box = nullptr; // the faded-in text stack
 static lv_obj_t* lbl_ticker_label = nullptr;
 static lv_obj_t* lbl_ticker_value = nullptr;
 static lv_obj_t* lbl_ticker_sub = nullptr;
+static lv_obj_t* lbl_ticker_zones = nullptr;   // clock card only: "ET ... UTC ..."
 // Cards are ordered clock, quote of the day, then one per market quote; each is
 // present only if its data is. ticker_card indexes the *live* list, so which
 // kind it lands on depends on what the daemon sent — ticker_card_kind() maps it.
@@ -696,13 +703,32 @@ static void build_control_bar(lv_obj_t* parent) {
 
 // ======== Center rotator ========
 
-// Local wall-clock time, from the daemon's last epoch advanced by lv_tick. The
-// epoch is already tz-shifted host-side, so gmtime_r keeps it as-is.
+// Local wall-clock epoch, from the daemon's last one advanced by lv_tick. It is
+// already tz-shifted host-side, so gmtime_r on it reads as local time.
+static long clock_now_epoch(void) {
+    return clock_base_epoch + (long)((lv_tick_get() - clock_base_ms) / 1000);
+}
+
 static bool clock_now(struct tm* out) {
     if (clock_base_epoch <= 0) return false;
-    time_t cur = (time_t)(clock_base_epoch + (lv_tick_get() - clock_base_ms) / 1000);
+    time_t cur = (time_t)clock_now_epoch();
     gmtime_r(&cur, out);
     return true;
+}
+
+// "14:23" / "2:23 PM", following the daemon's hour format. Used for the
+// secondary zones, so no seconds — only the local time gets those.
+static void format_hh_mm(long epoch, char* buf, size_t len) {
+    time_t t = (time_t)epoch;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    if (clock_fmt == 12) {
+        int h12 = tmv.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(buf, len, "%d:%02d %s", h12, tmv.tm_min, tmv.tm_hour < 12 ? "AM" : "PM");
+    } else {
+        snprintf(buf, len, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+    }
 }
 
 enum ticker_kind_t { TICKER_CLOCK, TICKER_QOD, TICKER_QUOTE };
@@ -775,6 +801,15 @@ static void build_ticker_panel(lv_obj_t* parent) {
     lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
     lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, off);
 
+    // Small print under the clock: the same instant in US Eastern and UTC.
+    // Hidden on every other card (and on the clock card when the daemon didn't
+    // send the offsets) — see render_ticker_card().
+    lbl_ticker_zones = lv_label_create(ticker_card_box);
+    lv_label_set_text(lbl_ticker_zones, "");
+    lv_obj_set_style_text_font(lbl_ticker_zones, L.ticker_zone_font, 0);
+    lv_obj_set_style_text_color(lbl_ticker_zones, COL_DIM, 0);
+    lv_obj_add_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
+
     // Page dots — parented to the panel, not the fading box, so they stay put
     // while the card behind them crossfades. Positioned in layout_ticker_dots()
     // once the live card count is known.
@@ -825,6 +860,9 @@ static const lv_font_t* pick_qod_font(size_t len) {
 // quote-of-the-day card. Switching between them retargets the same three labels
 // rather than building a second widget tree.
 static void set_ticker_card_shape(bool wrapped) {
+    // Only the clock card shows it, and only when the daemon sent the offsets;
+    // that branch un-hides it after this runs.
+    lv_obj_add_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
     if (wrapped) {
         lv_obj_add_flag(lbl_ticker_label, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_long_mode(lbl_ticker_value, LV_LABEL_LONG_WRAP);
@@ -895,6 +933,33 @@ static void render_ticker_card(void) {
         strftime(buf, sizeof(buf), "%b %d", &tmv);
         lv_label_set_text(lbl_ticker_sub, buf);
         lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
+
+        // Small print: the same instant in US Eastern and UTC. Each is dropped
+        // when its offset is zero — that's either "the host is already in this
+        // zone" or "the daemon doesn't send offsets", and printing the local
+        // time again under a different label would just read as a bug.
+        const long local_epoch = clock_now_epoch();
+        char zbuf[48] = "";
+        if (clock_et_off_min != 0) {
+            char t[16];
+            format_hh_mm(local_epoch + clock_et_off_min * 60L, t, sizeof(t));
+            snprintf(zbuf, sizeof(zbuf), "ET %s", t);
+        }
+        if (clock_utc_off_min != 0) {
+            char t[16];
+            format_hh_mm(local_epoch + clock_utc_off_min * 60L, t, sizeof(t));
+            size_t n = strlen(zbuf);
+            snprintf(zbuf + n, sizeof(zbuf) - n, "%sUTC %s", n ? "   " : "", t);
+        }
+        if (zbuf[0]) {
+            // The three-line stack shifts up to make room, rather than the
+            // zones line being squeezed against the page dots.
+            lv_label_set_text(lbl_ticker_zones, zbuf);
+            lv_obj_clear_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_align(lbl_ticker_value, LV_ALIGN_CENTER, 0, -14);
+            lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, L.ticker_h / 4 - 14);
+            lv_obj_align(lbl_ticker_zones, LV_ALIGN_CENTER, 0, L.ticker_h / 4 + 26);
+        }
         return;
     }
 
@@ -1273,9 +1338,12 @@ void ui_update(const UsageData* data) {
         clock_base_epoch = data->clock_epoch;
         clock_base_ms = last_data_ms;
         clock_fmt = data->clock_fmt;
+        clock_et_off_min = data->clock_et_off_min;
+        clock_utc_off_min = data->clock_utc_off_min;
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
+        clock_et_off_min = clock_utc_off_min = 0;
         lv_label_set_text(lbl_title, "Usage");
     }
 

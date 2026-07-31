@@ -453,19 +453,49 @@ def detect_hour_format() -> int:
     return 24
 
 
+def add_zone_offset_fields(payload: dict, now: float) -> None:
+    """Add "te"/"tu": minutes to add to the local clock for US Eastern and UTC.
+
+    The device gets a pre-shifted local epoch rather than a real UTC one, so the
+    secondary zones cross the wire as deltas from it — every timezone/DST rule
+    stays host-side. An offset of 0 (the host is already in that zone) is
+    omitted; the firmware would otherwise print the same time twice under two
+    different labels.
+    """
+    local_off = time.localtime(now).tm_gmtoff or 0
+    utc_delta = int(-local_off // 60)
+    if utc_delta:
+        payload["tu"] = utc_delta
+    try:
+        from zoneinfo import ZoneInfo
+
+        et_off = ZoneInfo("America/New_York").utcoffset(
+            datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+        ).total_seconds()
+    except (ImportError, KeyError, OSError, ValueError):
+        return  # no tzdata (e.g. a bare Windows install) — UTC still goes out
+    et_delta = int((et_off - local_off) // 60)
+    if et_delta:
+        payload["te"] = et_delta
+
+
 def add_clock_fields(payload: dict) -> None:
     """Add wall-clock fields to the payload when the config opts in.
 
     "t"  = local wall-clock epoch (UTC epoch shifted by the tz offset) so the
            device can show the time without an RTC.
     "tf" = 12 or 24, the hour format the device should render.
+    "te"/"tu" = minutes from that local time to US Eastern / UTC, for the small
+           print under the clock (see add_zone_offset_fields).
     """
     clock = read_clock_setting()
     if clock == "off":
         return
     tf = 24 if clock == "24" else 12 if clock == "12" else detect_hour_format()
-    payload["t"] = int(time.time()) + time.localtime().tm_gmtoff
+    now = time.time()
+    payload["t"] = int(now) + time.localtime(now).tm_gmtoff
     payload["tf"] = tf
+    add_zone_offset_fields(payload, now)
 
 
 def read_tickers_setting() -> list[str]:
