@@ -289,7 +289,7 @@ build_payload_for_token() {
     local clock clock_fragment=""
     clock=$(read_clock_setting)
     if [ "$clock" != "off" ]; then
-        local tz off_sec local_epoch tf
+        local tz off_sec local_epoch tf et_tz et_sec
         tz=$(date +%z)            # e.g. +0200 or -0500
         off_sec=$(( (10#${tz:1:2} * 3600) + (10#${tz:3:2} * 60) ))
         [ "${tz:0:1}" = "-" ] && off_sec=$(( -off_sec ))
@@ -300,6 +300,19 @@ build_payload_for_token() {
             *)  tf=$(detect_hour_format) ;;
         esac
         clock_fragment=",\"t\":$local_epoch,\"tf\":$tf"
+        # "te"/"tu": minutes from that local time to US Eastern / UTC, for the
+        # small print under the device's clock. Sent as deltas because the
+        # device only ever sees the shifted local epoch, so every tz/DST rule
+        # stays here. Zero (already in that zone) is omitted — the firmware
+        # would otherwise print the same time twice under two labels.
+        [ "$off_sec" -ne 0 ] && clock_fragment="$clock_fragment,\"tu\":$(( -off_sec / 60 ))"
+        et_tz=$(TZ=America/New_York date +%z 2>/dev/null)
+        if [ -n "$et_tz" ]; then
+            et_sec=$(( (10#${et_tz:1:2} * 3600) + (10#${et_tz:3:2} * 60) ))
+            [ "${et_tz:0:1}" = "-" ] && et_sec=$(( -et_sec ))
+            [ "$et_sec" -ne "$off_sec" ] && \
+                clock_fragment="$clock_fragment,\"te\":$(( (et_sec - off_sec) / 60 ))"
+        fi
     fi
 
     local headers

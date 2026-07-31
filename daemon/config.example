@@ -29,6 +29,8 @@ chime = off
 #           with no locale — set 12 or 24 explicitly below if auto guesses wrong)
 #   12   = show the clock, forced 12-hour  (e.g. 6:28 PM)
 #   24   = show the clock, forced 24-hour  (e.g. 18:28)
+# On boards with the center panel the clock also carries a small-print line with
+# the same instant in US Eastern and UTC (each dropped when it matches local).
 clock = off
 
 # Market quotes to show alongside the clock in the device's center panel, on

@@ -12,7 +12,7 @@ At minimum:
 
 - An **ESP32-S3** (other ESP32 family members may work; this is what the
   upstream firmware is tested on). OPI PSRAM is **required** — partial
-  flush buffers and the splash canvas are allocated from PSRAM.
+  flush buffers are allocated from PSRAM.
 - A QSPI **AMOLED panel** with a driver supported by
   [GFX Library for Arduino](https://github.com/moononournation/Arduino_GFX)
   (CO5300, SH8601, NV3041A, etc.). Other interfaces aren't supported yet.
@@ -79,7 +79,7 @@ Optional:
    real verification — any missing HAL symbol or duplicated definition
    shows up here.
 
-6. **Flash + smoke test.** The first boot should land on the splash
+6. **Flash + smoke test.** The first boot should land on the usage
    screen. If it doesn't, check `pio device monitor` for HAL init
    messages — every reference port logs OK / failure for display, touch,
    PMU, IMU during `setup()`.

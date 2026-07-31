@@ -1,7 +1,7 @@
 # HAL contract
 
 Each header under `firmware/src/hal/` defines functions that a board port
-must provide. The shared code (`main.cpp`, `ui.cpp`, `splash.cpp`) calls
+must provide. The shared code (`main.cpp`, `ui.cpp`, `creature.cpp`) calls
 these and nothing else. Where a function has non-functional requirements
 (latency, ordering), they're listed here — silently violating them tends
 to produce subtle bugs (dropped frames, missed events) rather than
@@ -81,6 +81,6 @@ A new screen size lands on the closer breakpoint and renders correctly
 without pixel-perfect alignment. If you want polish, add another branch
 to `compute_layout()` (please open a PR — others with that size benefit).
 
-The splash screen is fully responsive — `CELL` is computed as
-`min(width, height) / 20` so the 20×20 pixel-art creature fills the
-smaller display dimension and centers in the larger one.
+The idle screen's pixel-art creature is sized from the layout's
+`idle_px` (see `compute_layout()`) — its cell size is `idle_px / 20`, so
+it scales with the breakpoint rather than with the raw panel size.

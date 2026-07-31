@@ -14,29 +14,29 @@
 
 A small ESP32 dashboard to keep an eye on Claude Code usage.
 
-This fork runs on the round [Waveshare ESP32-S3-Touch-LCD-1.85B](https://www.waveshare.com/esp32-s3-touch-lcd-1.85b.htm?&aff_id=149786) and pairs over Bluetooth; the splash screen plays pixel-art Clawd animations that get
-busier when your usage rate climbs. The BOOT button sends Space over BLE HID for Claude Code's voice-mode shortcut. (The screenshots and side-button description below are inherited from the upstream project's square/AMOLED boards — see [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) for what's actually true on this board.)
+This fork runs on the round [Waveshare ESP32-S3-Touch-LCD-1.85B](https://www.waveshare.com/esp32-s3-touch-lcd-1.85b.htm?&aff_id=149786) and pairs over Bluetooth; it boots straight into the usage meter and stays there. The BOOT button sends Space over BLE HID for Claude Code's voice-mode shortcut. (The screenshots and side-button description below are inherited from the upstream project's square/AMOLED boards — see [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) for what's actually true on this board.)
 
-|              Usage meter              |              Clawd animation screen              |
-| :-----------------------------------: | :----------------------------------------------: |
-| ![Usage meter](assets/demo.jpeg) | ![Clawd animation screen](assets/demo.gif) |
+|              Usage meter              |              Idle (no data yet)              |
+| :-----------------------------------: | :------------------------------------------: |
+| ![Usage meter](assets/demo.jpeg) | ![Sleeping Clawd](assets/demo.gif) |
 
-The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
+The sleeping Clawd on the idle screen comes from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
 
 ## Screens
 
-The device boots into the splash. Tap the screen anywhere to switch to the Usage view; tap again to flip back to the splash.
+There's one screen — the Usage view (![Usage](screenshots/usage.png)), showing
+session and weekly utilization. It swaps itself for a pairing hint when
+Bluetooth is down and for a sleeping-Clawd idle screen when the host is
+connected but no usage data has landed recently.
 
-|              Splash               |              Usage              |
-| :-------------------------------: | :-----------------------------: |
-| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) |
-|   Splash; touch-toggle anytime    | Session and weekly utilization  |
+Taps on the usage numbers do nothing. On boards with enough spare vertical
+room for the center rotator (clock / quote of the day / market quotes), tapping
+that panel skips to the next card instead of waiting out its dwell.
 
-While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+**Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. A short PWR press cycles screen brightness.
 
-> The round LCD-1.85B board has no PWR button, so animation-cycling and the
-> hold-to-pair gesture above don't apply to it — touch-toggling between
-> splash and Usage still works fine. See
+> The round LCD-1.85B board has no PWR button, so the brightness cycling and
+> hold-to-pair gesture above don't apply to it. See
 > [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup).
 
 ## Agent worktree manager
@@ -67,7 +67,7 @@ These board ports live in the same shared HAL and will likely still build, but t
 
 > Please check if a pull request exists for your alternative hardware port before opening a new one, providing QA feedback and testing on the same hardware is more valuable than duplicate pull requests.
 
-**Porting to another board:** the firmware is a thin HAL with per-board folders under `firmware/src/boards/`. Drop in a new folder and a new PlatformIO env — `main.cpp`, `ui.cpp`, and `splash.cpp` never need to change. See [`docs/porting/adding-a-board.md`](docs/porting/adding-a-board.md) for the walk-through and [`docs/porting/hal-contract.md`](docs/porting/hal-contract.md) for the interfaces a port must implement.
+**Porting to another board:** the firmware is a thin HAL with per-board folders under `firmware/src/boards/`. Drop in a new folder and a new PlatformIO env — `main.cpp`, `ui.cpp`, and `creature.cpp` never need to change. See [`docs/porting/adding-a-board.md`](docs/porting/adding-a-board.md) for the walk-through and [`docs/porting/hal-contract.md`](docs/porting/hal-contract.md) for the interfaces a port must implement.
 
 ## Round board (LCD-1.85B) setup
 
@@ -95,10 +95,8 @@ differences worth knowing before you start:
   boards). Holding BOOT sends Space (Claude Code voice-mode push-to-talk),
   same as the "Left" button elsewhere in this README. There's no
   Shift+Tab/mode-toggle button on this board.
-- **No PWR-driven splash cycling or brightness cycling.** Both are normally
-  triggered by a PWR button this board doesn't have. You can still switch
-  between the splash and Usage screens by tapping the touchscreen — that
-  still works normally.
+- **No PWR-driven brightness cycling.** It's normally triggered by a PWR
+  button this board doesn't have.
 - **The hold-to-pair re-pair gesture doesn't work here either, for the same
   reason.** First-time pairing is unaffected — an unbonded device advertises
   immediately after flashing, so follow your OS's "Pair the device" steps
@@ -291,7 +289,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 3. The usage numbers come straight out of the response headers (`anthropic-ratelimit-unified-5h-utilization` and friends).
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
 5. The firmware parses it and updates the LVGL dashboard.
-6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
+6. The firmware watches for the session percentage dropping — that's the 5-hour limit refilling, and it chimes on boards with a buzzer.
 7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
 
 ## Physical buttons
@@ -300,12 +298,12 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 > below applies — there's no Middle/PWR or Right button. See
 > [Round board (LCD-1.85B) setup](#round-board-lcd-185b-setup) for specifics.
 
-The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
+The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles screen brightness and, held for 3 seconds, triggers pairing mode.
 
 | Button           | GPIO         | Function                                                       |
 | ---------------- | ------------ | -------------------------------------------------------------- |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing mode |
+| **Middle** (PWR) | AXP2101 PKEY | Press: cycle screen brightness. Hold 3s + release: pairing mode |
 | **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
 
 Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
@@ -336,6 +334,8 @@ Optional fields, each sent only when the daemon config opts in (see `daemon/conf
 | `c`    | `chime = on`    | `1` = play the session-reset chime                                                 |
 | `t`    | `clock = ...`   | Local wall-clock epoch (seconds, already tz-shifted) — the device has no RTC       |
 | `tf`   | `clock = ...`   | `12` or `24`, the hour format to render                                            |
+| `te`   | `clock = ...`   | Minutes from that local time to US Eastern, for the clock card's small print. Omitted when the host is already on ET |
+| `tu`   | `clock = ...`   | Minutes from that local time to UTC, same small print. Omitted when the host is already on UTC |
 | `q`    | `tickers = ...` | Market quotes: `[{"n":"AMZN","p":"$237.73","d":4.89}]` — symbol, formatted price, % change vs. previous close |
 | `qd`   | `quote_of_day = on` | Software quote: `{"t":"...","a":"Dijkstra"}` — text and author, rotating every 5 minutes. `"qd":1` instead of an object means "keep the current quote, an update follows in its own write" |
 
@@ -392,15 +392,18 @@ The UI uses a small set of [Lucide](https://lucide.dev) icons (bluetooth + batte
 node tools/png_to_lvgl.js assets/icon_bluetooth_48.png icon_bluetooth_data ICON_BLUETOOTH_WIDTH ICON_BLUETOOTH_HEIGHT
 ```
 
-Default tint is white (`0xFFFFFF`); Lucide PNGs ship as black-on-transparent and would render invisible against the dark UI without it. Pass `--no-tint` for pre-coloured artwork like the logo. Battery icons use RGB565A8 (alpha plane) so they blend cleanly over the splash; the rest are baked RGB565 over the panel colour. Paste the converter output into `firmware/src/icons.h`.
+Default tint is white (`0xFFFFFF`); Lucide PNGs ship as black-on-transparent and would render invisible against the dark UI without it. Pass `--no-tint` for pre-coloured artwork like the logo. Battery icons use RGB565A8 (alpha plane) so they blend cleanly over non-uniform backgrounds; the rest are baked RGB565 over the panel colour. Paste the converter output into `firmware/src/icons.h`.
 
-## Splash animations
+## Clawd animations
 
 The animations come from [claudepix.vercel.app](https://claudepix.vercel.app),
 a library of Clawd sprites. `tools/scrape_claudepix.js` evaluates the
 site's JavaScript in a Node VM to pull out frame data and palettes, then
 `tools/convert_to_c.js` turns everything into RGB565 C arrays and writes
-`firmware/src/splash_animations.h`.
+`firmware/src/splash_animations.h`. The firmware renders one of them
+(`expression sleep`) on the idle screen via `creature.cpp`; the rest are
+carried in the binary but unused since the full-screen animation view was
+removed.
 
 To re-pull (e.g. when the source library updates):
 

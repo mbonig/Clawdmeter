@@ -1,5 +1,5 @@
 #include "ui.h"
-#include "splash.h"
+#include "creature.h"
 #include <lvgl.h>
 #include <time.h>
 #include "logo.h"
@@ -67,6 +67,7 @@ struct Layout {
     const lv_font_t* ticker_value_font;   // the big line (time / price)
     const lv_font_t* ticker_label_font;   // caption above it (weekday / symbol)
     const lv_font_t* ticker_sub_font;     // line below it (date / percent change)
+    const lv_font_t* ticker_zone_font;    // clock card's small-print ET/UTC line
     const lv_font_t* ticker_qod_font;        // quote-of-the-day body (wrapped)
     const lv_font_t* ticker_qod_font_small;  // ...one step down, for longer text
     const lv_font_t* ticker_qod_font_tiny;   // ...and the smallest step
@@ -176,7 +177,7 @@ static void compute_layout(const BoardCaps& c) {
         L.pct_font   = &font_styrene_48;
         L.reset_font = &font_styrene_20;
         // Same class of bug as the null pct_font/reset_font above: idle_px was
-        // never set on this breakpoint (or "compact" below), so splash_mini_create()
+        // never set on this breakpoint (or "compact" below), so creature_create()
         // received px=0, floored its cell size to the 1px minimum, and rendered
         // the sleeping-creature idle screen as a 20x20px dot instead of a real
         // creature. Harmless-looking on every board that's shipped so far only
@@ -288,6 +289,7 @@ static void compute_layout(const BoardCaps& c) {
         L.ticker_value_font = big ? &font_tiempos_56 : &font_tiempos_34;
         L.ticker_label_font = big ? &font_styrene_28 : &font_styrene_20;
         L.ticker_sub_font   = big ? &font_styrene_28 : &font_styrene_20;
+        L.ticker_zone_font  = big ? &font_styrene_24 : &font_styrene_16;
         // The quote body picks its size from the text length at render time
         // (pick_qod_font) so a long quote shrinks to fit instead of being cut;
         // these are the largest/smallest ends of that range. Tiempos (the serif)
@@ -312,7 +314,7 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_RED       THEME_RED
 #define COL_BAR_BG    THEME_BAR_BG
 
-// ---- Usage screen widgets (single non-splash view) ----
+// ---- Usage screen widgets (the only view) ----
 static lv_obj_t* usage_container;
 static lv_obj_t* lbl_title;
 // Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
@@ -320,6 +322,10 @@ static lv_obj_t* lbl_title;
 static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
+// Minutes to add to the local clock for US Eastern / UTC (see data.h). Both 0
+// (no daemon support, or the host is already in that zone) hides that line.
+static int      clock_et_off_min = 0;
+static int      clock_utc_off_min = 0;
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
@@ -345,6 +351,7 @@ static lv_obj_t* ticker_card_box = nullptr; // the faded-in text stack
 static lv_obj_t* lbl_ticker_label = nullptr;
 static lv_obj_t* lbl_ticker_value = nullptr;
 static lv_obj_t* lbl_ticker_sub = nullptr;
+static lv_obj_t* lbl_ticker_zones = nullptr;   // clock card only: "ET ... UTC ..."
 // Cards are ordered clock, quote of the day, then one per market quote; each is
 // present only if its data is. ticker_card indexes the *live* list, so which
 // kind it lands on depends on what the daemon sent — ticker_card_kind() maps it.
@@ -383,7 +390,6 @@ static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within t
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
-static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
@@ -475,9 +481,6 @@ static void format_reset_time(int mins, char* buf, size_t len) {
     }
 }
 
-// Forward decls — callbacks defined near ui_show_screen below
-static void global_click_cb(lv_event_t* e);
-
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
     lv_obj_set_pos(panel, x, y);
@@ -516,8 +519,8 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
 // onto [start_angle, end_angle]) instead of a rectangular bar. Two of these,
 // covering the top and bottom halves respectively, form one ring split into
 // independent current/weekly fills. Non-interactive — knob removed, not
-// clickable — so it behaves like the bar it replaces (tap passes through to
-// usage_container's splash-toggle handler).
+// clickable — so it behaves like the bar it replaces: taps on the numbers do
+// nothing at all.
 static lv_obj_t* make_gauge_arc(lv_obj_t* parent, int32_t start_angle, int32_t end_angle) {
     lv_obj_t* arc = lv_arc_create(parent);
     lv_obj_set_size(arc, 2 * L.round_r_out, 2 * L.round_r_out);
@@ -623,8 +626,7 @@ static void init_control_bar_icons(void) {
 }
 
 // Buttons are plain lv_obj_t (not lv_btn_create()), matching this file's existing
-// hand-styled-panel convention. Deliberately NOT given LV_OBJ_FLAG_EVENT_BUBBLE, so a
-// tap here never reaches usage_container's global_click_cb (splash/idle toggle).
+// hand-styled-panel convention.
 static void control_btn_event_cb(lv_event_t* e) {
     lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
     ble_consumer_key_t key = (ble_consumer_key_t)(intptr_t)lv_obj_get_user_data(btn);
@@ -701,13 +703,32 @@ static void build_control_bar(lv_obj_t* parent) {
 
 // ======== Center rotator ========
 
-// Local wall-clock time, from the daemon's last epoch advanced by lv_tick. The
-// epoch is already tz-shifted host-side, so gmtime_r keeps it as-is.
+// Local wall-clock epoch, from the daemon's last one advanced by lv_tick. It is
+// already tz-shifted host-side, so gmtime_r on it reads as local time.
+static long clock_now_epoch(void) {
+    return clock_base_epoch + (long)((lv_tick_get() - clock_base_ms) / 1000);
+}
+
 static bool clock_now(struct tm* out) {
     if (clock_base_epoch <= 0) return false;
-    time_t cur = (time_t)(clock_base_epoch + (lv_tick_get() - clock_base_ms) / 1000);
+    time_t cur = (time_t)clock_now_epoch();
     gmtime_r(&cur, out);
     return true;
+}
+
+// "14:23" / "2:23 PM", following the daemon's hour format. Used for the
+// secondary zones, so no seconds — only the local time gets those.
+static void format_hh_mm(long epoch, char* buf, size_t len) {
+    time_t t = (time_t)epoch;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    if (clock_fmt == 12) {
+        int h12 = tmv.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(buf, len, "%d:%02d %s", h12, tmv.tm_min, tmv.tm_hour < 12 ? "AM" : "PM");
+    } else {
+        snprintf(buf, len, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+    }
 }
 
 enum ticker_kind_t { TICKER_CLOCK, TICKER_QOD, TICKER_QUOTE };
@@ -734,11 +755,21 @@ static ticker_kind_t ticker_card_kind(int i, int* quote_idx) {
     return TICKER_QUOTE;
 }
 
+// Tapping the rotator advances to the next card — defined below, once the
+// render/dot helpers it calls exist.
+static void ticker_click_cb(lv_event_t* e);
+
 // One panel cycling the clock and each quote the daemon sent: caption, big
 // value, sub-line, plus page dots. The text stack lives in its own transparent
 // box so a card change can fade the text in without pulsing the panel itself.
 static void build_ticker_panel(lv_obj_t* parent) {
     ticker_panel = make_panel(parent, L.margin, L.ticker_y, L.content_w, L.ticker_h);
+    // The panel is the one interactive thing on this screen: tap it to skip
+    // ahead instead of waiting out the dwell. Its children all bubble their
+    // events up here (make_panel/build below set LV_OBJ_FLAG_EVENT_BUBBLE), so
+    // a tap anywhere inside the panel counts.
+    lv_obj_add_flag(ticker_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ticker_panel, ticker_click_cb, LV_EVENT_CLICKED, NULL);
 
     ticker_card_box = lv_obj_create(ticker_panel);
     lv_obj_set_size(ticker_card_box, LV_PCT(100), LV_PCT(100));
@@ -769,6 +800,15 @@ static void build_ticker_panel(lv_obj_t* parent) {
     lv_obj_set_style_text_font(lbl_ticker_sub, L.ticker_sub_font, 0);
     lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
     lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, off);
+
+    // Small print under the clock: the same instant in US Eastern and UTC.
+    // Hidden on every other card (and on the clock card when the daemon didn't
+    // send the offsets) — see render_ticker_card().
+    lbl_ticker_zones = lv_label_create(ticker_card_box);
+    lv_label_set_text(lbl_ticker_zones, "");
+    lv_obj_set_style_text_font(lbl_ticker_zones, L.ticker_zone_font, 0);
+    lv_obj_set_style_text_color(lbl_ticker_zones, COL_DIM, 0);
+    lv_obj_add_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
 
     // Page dots — parented to the panel, not the fading box, so they stay put
     // while the card behind them crossfades. Positioned in layout_ticker_dots()
@@ -820,6 +860,9 @@ static const lv_font_t* pick_qod_font(size_t len) {
 // quote-of-the-day card. Switching between them retargets the same three labels
 // rather than building a second widget tree.
 static void set_ticker_card_shape(bool wrapped) {
+    // Only the clock card shows it, and only when the daemon sent the offsets;
+    // that branch un-hides it after this runs.
+    lv_obj_add_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
     if (wrapped) {
         lv_obj_add_flag(lbl_ticker_label, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_long_mode(lbl_ticker_value, LV_LABEL_LONG_WRAP);
@@ -890,6 +933,33 @@ static void render_ticker_card(void) {
         strftime(buf, sizeof(buf), "%b %d", &tmv);
         lv_label_set_text(lbl_ticker_sub, buf);
         lv_obj_set_style_text_color(lbl_ticker_sub, COL_DIM, 0);
+
+        // Small print: the same instant in US Eastern and UTC. Each is dropped
+        // when its offset is zero — that's either "the host is already in this
+        // zone" or "the daemon doesn't send offsets", and printing the local
+        // time again under a different label would just read as a bug.
+        const long local_epoch = clock_now_epoch();
+        char zbuf[48] = "";
+        if (clock_et_off_min != 0) {
+            char t[16];
+            format_hh_mm(local_epoch + clock_et_off_min * 60L, t, sizeof(t));
+            snprintf(zbuf, sizeof(zbuf), "ET %s", t);
+        }
+        if (clock_utc_off_min != 0) {
+            char t[16];
+            format_hh_mm(local_epoch + clock_utc_off_min * 60L, t, sizeof(t));
+            size_t n = strlen(zbuf);
+            snprintf(zbuf + n, sizeof(zbuf) - n, "%sUTC %s", n ? "   " : "", t);
+        }
+        if (zbuf[0]) {
+            // The three-line stack shifts up to make room, rather than the
+            // zones line being squeezed against the page dots.
+            lv_label_set_text(lbl_ticker_zones, zbuf);
+            lv_obj_clear_flag(lbl_ticker_zones, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_align(lbl_ticker_value, LV_ALIGN_CENTER, 0, -14);
+            lv_obj_align(lbl_ticker_sub, LV_ALIGN_CENTER, 0, L.ticker_h / 4 - 14);
+            lv_obj_align(lbl_ticker_zones, LV_ALIGN_CENTER, 0, L.ticker_h / 4 + 26);
+        }
         return;
     }
 
@@ -904,6 +974,25 @@ static void render_ticker_card(void) {
     } else {
         lv_label_set_text(lbl_ticker_sub, "");
     }
+}
+
+// Advance to the next card. Shared by the tap gesture and — implicitly, via the
+// dwell timer — by ticker_tick(). Restarts the dwell so a tapped card gets its
+// full time on screen rather than however much was left of the previous one.
+static void ticker_advance(void) {
+    const int n = ticker_card_count();
+    if (n <= 1) return;
+    ticker_card = (ticker_card + 1) % n;
+    ticker_card_ms = lv_tick_get();
+    ticker_dirty = false;
+    render_ticker_card();
+    layout_ticker_dots(n, ticker_card);
+    lv_obj_fade_in(ticker_card_box, TICKER_FADE_MS, 0);
+}
+
+static void ticker_click_cb(lv_event_t* e) {
+    (void)e;
+    ticker_advance();
 }
 
 // Called every loop from ui_tick_anim(). Advances the card on its own dwell,
@@ -922,7 +1011,6 @@ static void ticker_tick(uint32_t now) {
     }
     lv_obj_clear_flag(ticker_panel, LV_OBJ_FLAG_HIDDEN);
 
-    bool fade = false;
     if (n != shown_count) {
         shown_count = n;
         if (ticker_card >= n) ticker_card = 0;
@@ -932,16 +1020,15 @@ static void ticker_tick(uint32_t now) {
     const ticker_kind_t cur_kind = ticker_card_kind(ticker_card, &cur_quote_idx);
     const uint32_t dwell = (cur_kind == TICKER_QOD) ? TICKER_QOD_MS : TICKER_CARD_MS;
     if (n > 1 && now - ticker_card_ms >= dwell) {
-        ticker_card = (ticker_card + 1) % n;
-        ticker_card_ms = now;
-        ticker_dirty = fade = true;
+        ticker_advance();
+        return;
     }
 
+    // New data for the card already on screen — repaint in place, no fade.
     if (ticker_dirty) {
         ticker_dirty = false;
         render_ticker_card();
         layout_ticker_dots(n, ticker_card);
-        if (fade) lv_obj_fade_in(ticker_card_box, TICKER_FADE_MS, 0);
         return;
     }
     // Between switches only the clock card needs repainting, once per second.
@@ -1035,7 +1122,7 @@ static void build_idle_group(lv_obj_t* parent) {
     // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
+    lv_obj_t* creature = creature_create(idle_group, "expression sleep", L.idle_px);
     if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
@@ -1049,7 +1136,8 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_border_width(usage_container, 0, 0);
     lv_obj_set_style_pad_all(usage_container, 0, 0);
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    // No handler here: taps on the usage numbers are deliberately inert. Only the
+    // media buttons and the center rotator react to touch.
 
     lbl_title = lv_label_create(usage_container);
     lv_label_set_text(lbl_title, "Usage");
@@ -1178,10 +1266,8 @@ static void init_usage_screen(lv_obj_t* scr) {
 
     // pair_group/idle_group are created after the control bar and are both full-width
     // panels covering everything below the header, so in LVGL's create-order z-stacking
-    // they sit ON TOP of the bar and silently swallow every tap aimed at it (the press
-    // hit idle_group, bubbled to usage_container, and global_click_cb's dead zone then
-    // dropped it — so nothing happened at all). Lift the bar back to the front so its
-    // buttons are actually hittable on the idle screen.
+    // they sit ON TOP of the bar and silently swallow every tap aimed at it. Lift the
+    // bar back to the front so its buttons are actually hittable on the idle screen.
     if (control_bar) lv_obj_move_foreground(control_bar);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
@@ -1216,11 +1302,6 @@ void ui_init(void) {
     if (board_caps().has_media_controls) init_control_bar_icons();
 
     init_usage_screen(scr);
-    splash_init(scr);
-
-    if (splash_get_root()) {
-        lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
-    }
 
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
@@ -1257,9 +1338,12 @@ void ui_update(const UsageData* data) {
         clock_base_epoch = data->clock_epoch;
         clock_base_ms = last_data_ms;
         clock_fmt = data->clock_fmt;
+        clock_et_off_min = data->clock_et_off_min;
+        clock_utc_off_min = data->clock_utc_off_min;
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
+        clock_et_off_min = clock_utc_off_min = 0;
         lv_label_set_text(lbl_title, "Usage");
     }
 
@@ -1367,9 +1451,8 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
     update_view_state();
-    if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
+    if (view_state == 1) creature_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
 
@@ -1426,71 +1509,6 @@ void ui_tick_anim(void) {
     lv_label_set_text(lbl_anim, buf);
 }
 
-static screen_t prev_non_splash_screen = SCREEN_USAGE;
-static void apply_battery_visibility(void) {
-    if (!battery_img) return;
-    // Round boards keep it hidden regardless of screen — see ui_init().
-    if (L.is_round) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void global_click_cb(lv_event_t* e) {
-    (void)e;
-    // Ignore taps inside the media/volume control-bar band, so a near-miss on one of
-    // its buttons doesn't fall through to the "tap anywhere toggles splash" gesture
-    // and yank the screen away. Checked by raw coordinate rather than by which widget
-    // received the click, so it holds regardless of the hit-test path a near-miss
-    // takes through the widget tree.
-    //
-    // The band is the bar's own bounds plus a small margin. It used to be 300px,
-    // compensating for taps that appeared to land 150-300px short — but that was the
-    // GT911 field-misread bug (see boards/waveshare_p4_touch_lcd_5/touch.cpp), not
-    // real aiming error. Coordinates are accurate now, so the huge dead zone is
-    // unnecessary and only made a large part of the screen mysteriously inert.
-    if (board_caps().has_media_controls && L.control_bar_h > 0) {
-        lv_indev_t* indev = lv_indev_active();
-        if (indev) {
-            lv_point_t p;
-            lv_indev_get_point(indev, &p);
-            if (p.y >= L.control_bar_y - 20) return;
-        }
-    }
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
-}
-
-void ui_show_screen(screen_t screen) {
-    lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    splash_hide();
-
-    switch (screen) {
-    case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    default: break;
-    }
-
-    // Round boards never show the logo (no room for it in the header) —
-    // ui_init() hides it permanently, so leave it alone here.
-    if (logo_img && !L.is_round) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
-    current_screen = screen;
-    apply_battery_visibility();
-}
-
-void ui_toggle_splash(void) {
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
-}
-
-screen_t ui_get_current_screen(void) {
-    return current_screen;
-}
-
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
     (void)name; (void)mac;
     bool was_connected = s_ble_connected;
@@ -1518,5 +1536,4 @@ void ui_update_battery(int percent, bool charging) {
         idx = 3;
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
-    apply_battery_visibility();
 }

@@ -1,4 +1,4 @@
-# Splash animation tools
+# Clawd animation tools
 
 Two-step pipeline for getting third-party 20×20 pixel animations onto the device.
 
@@ -40,7 +40,7 @@ Reads `tools/claudepix_data/*.json` and emits a single
 - `splash_anims[]` — master table with name, category, frame count, pointers
 - `SPLASH_ANIM_COUNT`
 
-The firmware (`splash.cpp`) consumes this header to render and animate.
+The firmware (`creature.cpp`) consumes this header to render and animate the idle screen's creature.
 
 ## Re-running
 
